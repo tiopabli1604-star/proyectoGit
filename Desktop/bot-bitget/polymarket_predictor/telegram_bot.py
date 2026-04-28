@@ -297,13 +297,17 @@ def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
     if cmd in ("/help", "/start"):
         return (
             "🤖 <b>PolyiClaude Bot — Comandos</b>\n\n"
-            "/scan — escaneo inmediato de mercados\n"
-            "/top  — top 5 oportunidades ahora\n"
-            "/pos  — ver posiciones y P&L\n\n"
-            "/add <id> <YES|NO> <precio> <$>\n"
-            "  Ej: /add 0xabc YES 0.45 10\n\n"
-            "/remove <id> — eliminar posición\n\n"
-            "El monitor escanea automáticamente cada 15 min."
+            "📊 <b>Análisis</b>\n"
+            "/scan — escaneo inmediato\n"
+            "/top  — top 5 oportunidades ahora\n\n"
+            "💼 <b>Posiciones</b>\n"
+            "/pos  — ver P&amp;L de tus apuestas\n"
+            "/add &lt;id&gt; &lt;YES|NO&gt; &lt;precio&gt; &lt;$&gt;\n"
+            "/remove &lt;id&gt; — eliminar posición\n\n"
+            "💸 <b>Trading automático</b>\n"
+            "/buy &lt;id&gt; &lt;YES|NO&gt; &lt;$&gt; — ejecutar orden\n"
+            "/balance — ver USDC disponible\n\n"
+            "🌐 Dashboard: http://187.33.156.155:8080"
         )
 
     elif cmd == "/pos":
@@ -355,7 +359,7 @@ def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
         top_n = 5 if cmd == "/top" else MAX_ALERTS
         try:
             raw = predictor.client.get_all_markets(
-                keywords=topics_kw, max_pages=10)
+                keywords=topics_kw or None, max_pages=15)
             results = []
             for mkt in raw:
                 try:
@@ -378,6 +382,80 @@ def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
             return "\n".join(bloques)[:4000]
         except Exception as e:
             return f"❌ Error en escaneo: {e}"
+
+    elif cmd == "/buy":
+        # /buy <conditionId> <YES|NO> <cantidad$>
+        if len(cmd_parts) < 4:
+            return (
+                "Uso: /buy <conditionId> <YES|NO> <cantidad$>\n"
+                "Ej:  /buy 0xabc YES 10\n\n"
+                "⚠️ Requiere POLY_PRIVATE_KEY en .env"
+            )
+        try:
+            from trading.executor import is_configured, buy_yes, buy_no, get_balance, MAX_ORDER_USD, MIN_EDGE_TO_BUY
+            if not is_configured():
+                return ("❌ API de Polymarket no configurada.\n"
+                        "Añade POLY_PRIVATE_KEY al .env del servidor.")
+            cid    = cmd_parts[1]
+            action = cmd_parts[2].upper()
+            amount = float(cmd_parts[3])
+
+            if amount > MAX_ORDER_USD:
+                return f"❌ Máximo por orden: ${MAX_ORDER_USD:.0f}"
+
+            mkt = predictor.client.get_market(cid)
+            question = mkt.get("question", "?")
+            tokens = mkt.get("clobTokenIds", [])
+            if isinstance(tokens, str):
+                import json as _j
+                try: tokens = _j.loads(tokens)
+                except: tokens = []
+
+            if not tokens:
+                return "❌ No se encontraron tokens para este mercado."
+
+            balance = get_balance()
+            if balance is not None and balance < amount:
+                return f"❌ Balance insuficiente: ${balance:.2f} < ${amount:.2f}"
+
+            if action == "YES":
+                result = buy_yes(cid, tokens[0], amount, question)
+            else:
+                token_no = tokens[1] if len(tokens) > 1 else tokens[0]
+                result = buy_no(cid, token_no, amount, question)
+
+            if result["ok"]:
+                from positions import add_position
+                prices = mkt.get("outcomePrices", [])
+                if isinstance(prices, str):
+                    import json as _j
+                    try: prices = _j.loads(prices)
+                    except: prices = []
+                entry_price = float(prices[0]) if action == "YES" else (1 - float(prices[0])) if prices else 0.5
+                add_position(cid, question, action, entry_price, amount)
+                return (
+                    f"✅ <b>Orden ejecutada</b>\n\n"
+                    f"{question[:60]}\n"
+                    f"Acción: {action}  |  Cantidad: ${amount:.2f}\n"
+                    f"Filled: {result.get('filled', 0):.2f} contratos\n\n"
+                    f"Posición registrada. Usa /pos para ver tu P&L."
+                )
+            else:
+                return f"❌ Error ejecutando orden: {result.get('error', 'desconocido')}"
+        except ValueError:
+            return "❌ Cantidad inválida. Ej: /buy 0xabc YES 10"
+        except Exception as e:
+            return f"❌ Error: {e}"
+
+    elif cmd == "/balance":
+        try:
+            from trading.executor import get_balance, is_configured
+            if not is_configured():
+                return "❌ API no configurada. Necesitas POLY_PRIVATE_KEY en .env"
+            bal = get_balance()
+            return f"💰 Balance en Polymarket: <b>${bal:.2f} USDC</b>" if bal is not None else "❌ Error obteniendo balance."
+        except Exception as e:
+            return f"❌ Error: {e}"
 
     return f"❓ Comando no reconocido: {cmd}\nEscribe /help para ver los comandos."
 
@@ -471,6 +549,15 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
 
     from predictor import PolymarketPredictor
 
+    # Arranca el dashboard web en background
+    try:
+        from dashboard.app import run_dashboard
+        dash_thread = threading.Thread(target=run_dashboard, daemon=True)
+        dash_thread.start()
+        logger.info("Dashboard web iniciado en :8080")
+    except Exception as e:
+        logger.warning(f"Dashboard no disponible: {e}")
+
     predictor = PolymarketPredictor(bankroll=bankroll)
     seen      = _load_seen()
 
@@ -531,6 +618,12 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
         except Exception as e:
             logger.debug(f"Error checking positions: {e}")
 
+        # ── Force scan desde dashboard ──
+        if Path("force_scan.flag").exists():
+            try: Path("force_scan.flag").unlink()
+            except Exception: pass
+            logger.info("Escaneo forzado desde dashboard")
+
         # ── Escaneo de mercados (cada interval segundos) ──
         scan_count += 1
         try:
@@ -571,6 +664,28 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                 (i+1, m) for i, m in enumerate(opportunities)
                 if _is_new_opportunity(m.condition_id, m.prediction.edge, seen)
             ]
+
+            # Guarda oportunidades para el dashboard
+            try:
+                opp_data = [{
+                    "question":     m.question[:80],
+                    "market_price": m.prediction.market_price,
+                    "probability":  m.prediction.probability,
+                    "edge":         m.prediction.edge,
+                    "confidence":   m.prediction.confidence,
+                    "action":       m.prediction.recommendation,
+                    "closes_in":    _tiempo_restante(m.days_left),
+                    "condition_id": m.condition_id,
+                } for m in opportunities[:20]]
+                Path("last_opportunities.json").write_text(
+                    json.dumps(opp_data, ensure_ascii=False)
+                )
+                from dashboard.app import _state as dash_state
+                dash_state["last_scan"]   = datetime.now(timezone.utc).isoformat()
+                dash_state["scan_count"]  = scan_count
+                dash_state["opportunities"] = opp_data
+            except Exception:
+                pass
 
             # Guarda las mejores del día para el resumen
             best_today = sorted(
