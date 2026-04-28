@@ -1,9 +1,17 @@
 """
 Notificaciones Telegram + loop de monitoreo automático.
 
-Uso:
-  1. Primero obtén tu chat_id:   py telegram_bot.py --setup
-  2. Luego lanza el monitor:     py telegram_bot.py --monitor
+Comandos disponibles (envía desde Telegram):
+  /scan      — escaneo inmediato
+  /top       — top 5 oportunidades ahora
+  /pos       — ver tus posiciones y P&L
+  /add <conditionId> <YES|NO> <precio> <cantidad$>  — añadir posición
+  /remove <conditionId>                              — eliminar posición
+  /help      — ayuda
+
+Uso CLI:
+  py telegram_bot.py --setup    → detecta tu chat_id
+  py telegram_bot.py --monitor  → lanza el monitor continuo
 """
 
 import os
@@ -12,10 +20,11 @@ import json
 import time
 import logging
 import argparse
+import threading
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -23,25 +32,24 @@ load_dotenv()
 
 TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-PROXY   = os.getenv("TELEGRAM_PROXY", "")   # ej: socks5://127.0.0.1:1080
+PROXY   = os.getenv("TELEGRAM_PROXY", "")
 
-SEEN_FILE    = Path("notified_markets.json")   # mercados ya notificados
-SCAN_INTERVAL = 15 * 60                         # cada 15 minutos
-MAX_ALERTS    = 10                              # máximo mensajes por escaneo
+SEEN_FILE     = Path("notified_markets.json")
+SCAN_INTERVAL = 15 * 60     # 15 minutos
+MAX_ALERTS    = 10
+DAILY_SUMMARY_HOUR = 9      # resumen a las 9:00 UTC
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ── Telegram helpers ────────────────────────────────────────────────
+# ── Telegram SSL fix (WinError 10054 + servidor Linux) ───────────────
 
 class _TLS12Adapter(HTTPAdapter):
-    """Fuerza TLS 1.2 — fix para WinError 10054 en Python 3.14/Windows."""
     def init_poolmanager(self, *args, **kwargs):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         kwargs["ssl_context"] = ctx
@@ -51,7 +59,7 @@ class _TLS12Adapter(HTTPAdapter):
 def _new_tg_session() -> requests.Session:
     session = requests.Session()
     session.mount("https://", _TLS12Adapter())
-    session.trust_env = False   # ignora proxies del sistema Windows
+    session.trust_env = False
     session.verify = False
     if PROXY:
         session.proxies = {"https": PROXY, "http": PROXY}
@@ -81,15 +89,13 @@ def send_message(chat_id: str, text: str) -> bool:
 
 
 def get_updates(offset: int = 0) -> list:
-    # long polling: timeout=20 en Telegram, req_timeout mayor para no cortar
     res = _tg("getUpdates", req_timeout=30, _retries=1, offset=offset, timeout=20)
     return res.get("result", [])
 
 
-# ── Setup: detectar chat_id automáticamente ─────────────────────────
+# ── Setup ────────────────────────────────────────────────────────────
 
 def setup():
-    """Espera a que el usuario envíe un mensaje al bot y guarda el chat_id."""
     if not TOKEN:
         print("ERROR: TELEGRAM_TOKEN no configurado en .env")
         return
@@ -97,7 +103,7 @@ def setup():
     print("\n" + "="*50)
     print("SETUP — Detección de Chat ID")
     print("="*50)
-    print(f"\n1. Abre Telegram y busca tu bot: @PolyiClaude_bot")
+    print(f"\n1. Abre Telegram y busca tu bot")
     print("2. Envíale cualquier mensaje (ej: 'hola')")
     print("3. Esperando...\n")
 
@@ -106,35 +112,34 @@ def setup():
         updates = get_updates(offset)
         for upd in updates:
             offset = upd["update_id"] + 1
-            msg = upd.get("message", {})
+            msg  = upd.get("message", {})
             chat = msg.get("chat", {})
-            chat_id = str(chat.get("id", ""))
+            chat_id  = str(chat.get("id", ""))
             username = chat.get("username", chat.get("first_name", "?"))
 
             if chat_id:
                 print(f"✓ Chat ID detectado: {chat_id}  (usuario: {username})")
-
-                # Guarda en .env
                 env_path = Path(".env")
-                content = env_path.read_text()
+                content  = env_path.read_text() if env_path.exists() else ""
                 if "TELEGRAM_CHAT_ID=" in content:
-                    lines = content.splitlines()
-                    lines = [f"TELEGRAM_CHAT_ID={chat_id}" if l.startswith("TELEGRAM_CHAT_ID=")
-                             else l for l in lines]
+                    lines = [f"TELEGRAM_CHAT_ID={chat_id}"
+                             if l.startswith("TELEGRAM_CHAT_ID=") else l
+                             for l in content.splitlines()]
                     env_path.write_text("\n".join(lines) + "\n")
                 else:
                     env_path.write_text(content + f"\nTELEGRAM_CHAT_ID={chat_id}\n")
 
-                # Mensaje de bienvenida
                 send_message(chat_id, (
                     "✅ <b>PolyiClaude Bot activado</b>\n\n"
-                    "Te avisaré cuando encuentre oportunidades en Polymarket.\n"
-                    "Lanza el monitor con: <code>py telegram_bot.py --monitor</code>"
+                    "Comandos disponibles:\n"
+                    "/scan — escaneo inmediato\n"
+                    "/top  — top 5 oportunidades\n"
+                    "/pos  — tus posiciones y P&L\n"
+                    "/add  — registrar apuesta\n"
+                    "/help — ayuda completa"
                 ))
                 print("\n✓ Chat ID guardado en .env")
-                print("  Ahora ejecuta: py telegram_bot.py --monitor")
                 return
-
         time.sleep(2)
 
 
@@ -158,27 +163,24 @@ def _tiempo_restante(days_left):
 
 
 def _format_alert(analysis, rank: int) -> str:
-    p    = analysis.prediction
-    pos  = analysis.position
-    t    = _tiempo_restante(analysis.days_left)
+    p      = analysis.prediction
+    t      = _tiempo_restante(analysis.days_left)
     cierre = analysis.end_date[:10] if analysis.end_date else "?"
 
     accion = "BUY YES" if p.edge > 0 else "BUY NO"
     precio_entrada = p.market_price if p.edge > 0 else 1 - p.market_price
-    ganancia_10 = round(10 / precio_entrada - 10, 2)
-    edge_stars = "⭐" * min(5, max(1, int(abs(p.edge) * 20)))
+    ganancia_10 = round(10 / precio_entrada - 10, 2) if precio_entrada > 0 else 0
+    edge_stars  = "⭐" * min(5, max(1, int(abs(p.edge) * 20)))
 
-    # Señales externas (Kalshi / Manifold)
-    ext = getattr(analysis, "external", {})
-    ext_line = ""
+    # Señales externas
+    ext  = getattr(analysis, "external", {})
     kal  = ext.get("kalshi")
     mani = ext.get("manifold")
+    ext_line = ""
     if kal and kal.get("prob") is not None:
-        ext_line = (f"\n🏛 Kalshi: <b>{kal['prob']:.0%}</b>"
-                    f"  (similitud {kal['similarity']:.0%})")
+        ext_line += f"\n🏛 Kalshi: <b>{kal['prob']:.0%}</b>  (similitud {kal['similarity']:.0%})"
     if mani and mani.get("prob") is not None:
-        ext_line += (f"\n🔀 Manifold: <b>{mani['prob']:.0%}</b>"
-                     f"  (similitud {mani['similarity']:.0%})")
+        ext_line += f"\n🔀 Manifold: <b>{mani['prob']:.0%}</b>  (similitud {mani['similarity']:.0%})"
 
     news = ext.get("news", {})
     news_line = ""
@@ -191,15 +193,16 @@ def _format_alert(analysis, rank: int) -> str:
         f"{'━'*38}\n"
         f"<b>#{rank} {analysis.question[:80]}</b>\n"
         f"📅 Cierra: {cierre}  {t}\n"
-        f"\n💲 Mercado: <b>{p.market_price:.0%}</b>  →  Mi estimación: <b>{p.probability:.0%}</b>"
+        f"\n💲 Mercado: <b>{p.market_price:.0%}</b>  →  Estimación: <b>{p.probability:.0%}</b>"
         f"{ext_line}{news_line}\n"
         f"📈 Edge: <b>{p.edge:+.0%}</b>  Confianza: <b>{p.confidence:.0%}</b>  {edge_stars}\n"
         f"🎯 Acción: <b>{accion} @ {precio_entrada:.2f}</b>\n"
         f"💵 Con $10 ganarías: <b>${ganancia_10:.2f}</b>  (ROI: {analysis.ev['roi']:.0%})\n"
+        f"🆔 <code>{analysis.condition_id[:20]}...</code>\n"
     )
 
 
-# ── Tracking de mercados ya notificados ─────────────────────────────
+# ── Tracking de mercados notificados ─────────────────────────────────
 
 def _load_seen() -> dict:
     if SEEN_FILE.exists():
@@ -215,43 +218,262 @@ def _save_seen(seen: dict):
 
 
 def _is_new_opportunity(condition_id: str, edge: float, seen: dict) -> bool:
-    """
-    Notifica si:
-    - Es un mercado nuevo (nunca visto), o
-    - El edge cambió más de 3 puntos respecto a la última notificación
-    """
     if condition_id not in seen:
         return True
     prev_edge = seen[condition_id].get("edge", 0)
     return abs(edge - prev_edge) >= 0.03
 
 
-# ── Loop de monitoreo ────────────────────────────────────────────────
+# ── Topics / Keywords ────────────────────────────────────────────────
 
 TOPICS = {
-    "elon":        ["elon", "musk", "tesla", "spacex", "doge", "x.com"],
-    "geopolitica": ["ukraine", "russia", "ceasefire", "war", "nato", "china",
-                    "taiwan", "iran", "israel", "gaza", "trump", "sanctions"],
-    "crypto":      ["bitcoin", "ethereum", "btc", "eth", "crypto", "solana"],
-    "deportes":    ["nba", "nfl", "nhl", "stanley cup", "super bowl", "championship"],
+    "elon": [
+        "elon", "musk", "tesla", "spacex", "doge", "dogecoin",
+        "x.com", "twitter", "grok", "xai", "neuralink", "starlink",
+        "department of government", "doge cut", "boring company",
+        "tweets", "tweet count", "posts april", "posts may",
+    ],
+    "geopolitica": [
+        "ukraine", "russia", "ceasefire", "war", "nato", "china",
+        "taiwan", "iran", "israel", "gaza", "trump", "sanctions",
+        "tariff", "tariffs", "trade war", "xi jinping", "putin",
+        "zelensky", "kim jong", "north korea", "middle east",
+    ],
+    "crypto": [
+        "bitcoin", "ethereum", "btc", "eth", "crypto", "solana",
+        "xrp", "coinbase", "binance", "sol", "defi", "nft",
+        "altcoin", "stablecoin", "sec crypto", "etf bitcoin",
+    ],
+    "deportes": [
+        "nba", "nfl", "nhl", "stanley cup", "super bowl",
+        "championship", "world cup", "wimbledon", "ufc",
+        "formula 1", "f1", "lakers", "warriors", "celtics",
+        "playoffs", "finals", "champion",
+    ],
+    "politica_usa": [
+        "trump", "biden", "harris", "congress", "senate", "house",
+        "republican", "democrat", "election", "vote", "president",
+        "supreme court", "white house", "executive order",
+    ],
 }
 
 
+# ── Correlación entre mercados ───────────────────────────────────────
+
+def _detect_contradictions(opportunities: list) -> set:
+    """
+    Detecta pares de mercados donde apostar en ambos se contradice.
+    Ej: 'A gana el campeonato' y 'B gana el campeonato'.
+    Retorna los condition_ids del segundo mercado de cada par contradictorio.
+    """
+    flagged = set()
+    seen_themes = {}
+
+    for analysis in opportunities:
+        q = analysis.question.lower()
+        words = set(q.split())
+        for prev_id, prev_words in seen_themes.items():
+            # Si comparten muchas palabras clave pero son mercados distintos
+            overlap = len(words & prev_words) / max(len(words | prev_words), 1)
+            if overlap > 0.5 and prev_id != analysis.condition_id:
+                # Marca el de menor score como contradicción
+                flagged.add(analysis.condition_id)
+        seen_themes[analysis.condition_id] = words
+
+    return flagged
+
+
+# ── Comandos Telegram (bidireccional) ────────────────────────────────
+
+def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
+                    market_type: str, min_edge: float) -> str:
+    """Procesa un comando enviado por el usuario y retorna la respuesta."""
+    from positions import (add_position, remove_position,
+                           format_positions_message, get_all)
+
+    cmd_parts = text.strip().split()
+    cmd = cmd_parts[0].lower()
+
+    if cmd in ("/help", "/start"):
+        return (
+            "🤖 <b>PolyiClaude Bot — Comandos</b>\n\n"
+            "/scan — escaneo inmediato de mercados\n"
+            "/top  — top 5 oportunidades ahora\n"
+            "/pos  — ver posiciones y P&L\n\n"
+            "/add <id> <YES|NO> <precio> <$>\n"
+            "  Ej: /add 0xabc YES 0.45 10\n\n"
+            "/remove <id> — eliminar posición\n\n"
+            "El monitor escanea automáticamente cada 15 min."
+        )
+
+    elif cmd == "/pos":
+        return format_positions_message()
+
+    elif cmd == "/remove":
+        if len(cmd_parts) < 2:
+            return "Uso: /remove <conditionId>"
+        cid = cmd_parts[1]
+        if remove_position(cid):
+            return f"✅ Posición {cid[:20]}... eliminada."
+        return f"❌ No encontré la posición {cid[:20]}..."
+
+    elif cmd == "/add":
+        if len(cmd_parts) < 5:
+            return (
+                "Uso: /add <conditionId> <YES|NO> <precio> <cantidad$>\n"
+                "Ej:  /add 0xabc123 YES 0.45 10"
+            )
+        try:
+            cid    = cmd_parts[1]
+            action = cmd_parts[2].upper()
+            price  = float(cmd_parts[3])
+            amount = float(cmd_parts[4])
+            if action not in ("YES", "NO"):
+                return "❌ La acción debe ser YES o NO"
+            if not (0 < price < 1):
+                return "❌ El precio debe estar entre 0 y 1 (ej: 0.45)"
+
+            # Busca la pregunta del mercado
+            try:
+                mkt = predictor.client.get_market(cid)
+                question = mkt.get("question", "Mercado desconocido")
+            except Exception:
+                question = "Mercado desconocido"
+
+            pos = add_position(cid, question, action, price, amount)
+            return (
+                f"✅ <b>Posición registrada</b>\n\n"
+                f"Mercado: {question[:60]}\n"
+                f"Acción: {action} @ {price:.0%}\n"
+                f"Inversión: ${amount:.2f}\n\n"
+                f"Te avisaré cuando suba +20% o baje -25%."
+            )
+        except (ValueError, IndexError):
+            return "❌ Formato incorrecto. Usa: /add <id> <YES|NO> <precio> <cantidad>"
+
+    elif cmd in ("/scan", "/top"):
+        top_n = 5 if cmd == "/top" else MAX_ALERTS
+        try:
+            raw = predictor.client.get_all_markets(
+                keywords=topics_kw, max_pages=10)
+            results = []
+            for mkt in raw:
+                try:
+                    a = predictor._analyze_market(mkt, market_type)
+                    if a:
+                        results.append(a)
+                except Exception:
+                    pass
+            results.sort(key=lambda a: a.score, reverse=True)
+            opps = [m for m in results
+                    if abs(m.prediction.edge) >= min_edge
+                    and m.prediction.confidence >= 0.4][:top_n]
+
+            if not opps:
+                return f"🔍 Sin oportunidades con edge ≥ {min_edge:.0%} ahora mismo."
+
+            bloques = [f"🔍 <b>{len(opps)} oportunidad(es)</b>\n"]
+            for i, a in enumerate(opps, 1):
+                bloques.append(_format_alert(a, i))
+            return "\n".join(bloques)[:4000]
+        except Exception as e:
+            return f"❌ Error en escaneo: {e}"
+
+    return f"❓ Comando no reconocido: {cmd}\nEscribe /help para ver los comandos."
+
+
+# ── Resumen diario ───────────────────────────────────────────────────
+
+def _should_send_daily_summary(last_summary_date: str) -> bool:
+    now = datetime.now(timezone.utc)
+    if now.hour != DAILY_SUMMARY_HOUR:
+        return False
+    today = now.strftime("%Y-%m-%d")
+    return last_summary_date != today
+
+
+def _build_daily_summary(seen: dict, best_today: list) -> str:
+    from positions import format_positions_message
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    pos_msg = format_positions_message()
+    total_tracked = len(seen)
+
+    lines = [
+        f"☀️ <b>Resumen diario — {now_str}</b>\n",
+        f"📊 Mercados rastreados: {total_tracked}",
+    ]
+    if best_today:
+        lines.append(f"\n🏆 <b>Mejores de las últimas 24h:</b>")
+        for i, a in enumerate(best_today[:3], 1):
+            lines.append(f"  {i}. {a.question[:60]} — edge {a.prediction.edge:+.0%}")
+    lines.append(f"\n{pos_msg[:1500]}")
+    return "\n".join(lines)
+
+
+# ── Monitoreo de posiciones ──────────────────────────────────────────
+
+def _check_position_alerts(predictor) -> list[str]:
+    """
+    Comprueba si alguna posición llegó al target o al stop loss.
+    Retorna lista de mensajes de alerta.
+    """
+    from positions import get_all, update_price, check_alerts, calc_pnl
+
+    alerts = []
+    positions = get_all()
+    if not positions:
+        return []
+
+    for cid, pos in positions.items():
+        try:
+            mkt = predictor.client.get_market(cid)
+            prices = mkt.get("outcomePrices", [])
+            if isinstance(prices, str):
+                import json as _json
+                try:
+                    prices = _json.loads(prices)
+                except Exception:
+                    prices = []
+            if not prices:
+                continue
+            current_price = float(prices[0])
+            update_price(cid, current_price)
+            alert = check_alerts(cid)
+            if alert:
+                emoji = "🚀" if alert["type"] == "PROFIT" else "🛑"
+                action_price = (current_price if pos["action"] == "YES"
+                                else 1 - current_price)
+                msg = (
+                    f"{emoji} <b>Alerta de posición</b>\n\n"
+                    f"{pos['question'][:70]}\n\n"
+                    f"Entrada: {pos['entry_price']:.0%}  →  Ahora: {current_price:.0%}\n"
+                    f"P&L: <b>{alert['pnl_usd']:+.2f}$ ({alert['pct_change']:+.0%})</b>\n\n"
+                )
+                if alert["type"] == "PROFIT":
+                    msg += f"✅ <b>¡Target alcanzado! Considera vender @ {action_price:.2f}</b>"
+                else:
+                    msg += f"⚠️ <b>Stop loss activado. Considera salir @ {action_price:.2f}</b>"
+                alerts.append(msg)
+        except Exception as e:
+            logger.debug(f"Error checking position {cid}: {e}")
+
+    return alerts
+
+
+# ── Loop de monitoreo principal ──────────────────────────────────────
+
 def monitor(bankroll: float, limit: int, market_type: str, interval: int,
-            min_edge: float, topics: list[str] = None):
+            min_edge: float, topics: list = None):
     if not TOKEN or not CHAT_ID:
         print("ERROR: Falta TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en .env")
-        print("Ejecuta primero: py telegram_bot.py --setup")
         return
 
-    # Import aquí para no requerir todo el stack si sólo se hace setup
     from predictor import PolymarketPredictor
-    from config import EDGE_THRESHOLD
 
     predictor = PolymarketPredictor(bankroll=bankroll)
     seen      = _load_seen()
 
-    # Construye keywords combinadas de todos los topics seleccionados
     kw = None
     if topics:
         kw = []
@@ -262,18 +484,58 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
     send_message(CHAT_ID, (
         f"🚀 <b>Monitor iniciado</b>\n"
         f"Temas: {topics_str} | Cada {interval//60} min | "
-        f"Edge mínimo: {min_edge:.0%} | Bankroll: ${bankroll:.0f}"
+        f"Edge mínimo: {min_edge:.0%} | Bankroll: ${bankroll:.0f}\n\n"
+        f"Comandos: /scan /top /pos /add /help"
     ))
 
     logger.info(f"Monitor activo — intervalo {interval}s, topics: {topics_str}")
 
-    scan_count = 0
+    scan_count      = 0
+    update_offset   = 0
+    last_summary    = ""
+    best_today: list = []
+    last_cmd_check  = 0
+
     while True:
+        # ── Comandos Telegram (cada 30s) ──
+        now_ts = time.time()
+        if now_ts - last_cmd_check >= 30:
+            last_cmd_check = now_ts
+            try:
+                updates = get_updates(update_offset)
+                for upd in updates:
+                    update_offset = upd["update_id"] + 1
+                    msg  = upd.get("message", {})
+                    text = msg.get("text", "").strip()
+                    if text.startswith("/"):
+                        logger.info(f"Comando recibido: {text}")
+                        resp = _handle_command(
+                            text, predictor, seen, kw or [],
+                            market_type, min_edge)
+                        send_message(CHAT_ID, resp)
+            except Exception as e:
+                logger.debug(f"Error checking commands: {e}")
+
+        # ── Resumen diario ──
+        if _should_send_daily_summary(last_summary):
+            msg = _build_daily_summary(seen, best_today)
+            send_message(CHAT_ID, msg)
+            last_summary = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            best_today = []
+
+        # ── Alertas de posiciones ──
         try:
-            scan_count += 1
+            pos_alerts = _check_position_alerts(predictor)
+            for alert_msg in pos_alerts:
+                send_message(CHAT_ID, alert_msg)
+        except Exception as e:
+            logger.debug(f"Error checking positions: {e}")
+
+        # ── Escaneo de mercados (cada interval segundos) ──
+        scan_count += 1
+        try:
             logger.info(f"Escaneo #{scan_count}…")
 
-            # Alterna entre mercados normales y eventos con sub-mercados
             if scan_count % 2 == 0:
                 raw_markets = predictor.client.get_all_events_markets(
                     keywords=kw, max_pages=30)
@@ -283,7 +545,6 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                     keywords=kw, max_pages=20)
                 logger.info(f"Via mercados: {len(raw_markets)} mercados")
 
-            # Analiza solo los que tienen suficiente liquidez
             results = []
             for mkt in raw_markets:
                 try:
@@ -301,22 +562,33 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                 and m.prediction.confidence >= 0.4
             ]
 
+            # Filtra mercados contradictorios entre sí
+            contradictions = _detect_contradictions(opportunities)
+            opportunities = [m for m in opportunities
+                             if m.condition_id not in contradictions]
+
             nuevas = [
                 (i+1, m) for i, m in enumerate(opportunities)
                 if _is_new_opportunity(m.condition_id, m.prediction.edge, seen)
             ]
 
+            # Guarda las mejores del día para el resumen
+            best_today = sorted(
+                best_today + [m for _, m in nuevas],
+                key=lambda a: a.score, reverse=True
+            )[:10]
+
             if nuevas:
                 now_str = datetime.now(timezone.utc).strftime('%H:%M UTC')
-                header = (
+                header  = (
                     f"🔍 <b>{len(nuevas)} apuesta(s) destacada(s)</b>  •  {now_str}\n"
                     f"ordenadas por edge × confianza × urgencia\n\n"
-                )  # reemplaza el bloque original
+                )
                 bloques = [header]
                 for rank, analysis in nuevas[:MAX_ALERTS]:
                     bloques.append(_format_alert(analysis, rank))
                     seen[analysis.condition_id] = {
-                        "edge":  round(analysis.prediction.edge, 4),
+                        "edge":       round(analysis.prediction.edge, 4),
                         "notified_at": datetime.now(timezone.utc).isoformat(),
                     }
 
@@ -330,7 +602,10 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                 _save_seen(seen)
                 logger.info(f"Enviadas {len(nuevas)} alertas")
             else:
-                logger.info(f"Sin nuevas oportunidades ({len(opportunities)} analizadas, escaneo #{scan_count})")
+                logger.info(
+                    f"Sin nuevas oportunidades "
+                    f"({len(opportunities)} analizadas, escaneo #{scan_count})"
+                )
 
         except Exception as e:
             logger.error(f"Error en escaneo #{scan_count}: {e}")
@@ -342,20 +617,16 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PolyiClaude Telegram Bot")
-    parser.add_argument("--setup",    action="store_true",
-                        help="Detecta tu chat_id automáticamente")
-    parser.add_argument("--monitor",  action="store_true",
-                        help="Lanza el monitor continuo")
+    parser.add_argument("--setup",    action="store_true")
+    parser.add_argument("--monitor",  action="store_true")
     parser.add_argument("--bankroll", type=float, default=1000.0)
     parser.add_argument("--limit",    type=int,   default=100)
     parser.add_argument("--type",     default="default",
                         choices=["politics", "sports", "crypto", "economics", "default"])
-    parser.add_argument("--interval", type=int,   default=SCAN_INTERVAL,
-                        help="Segundos entre escaneos (default: 900 = 15 min)")
-    parser.add_argument("--min-edge", type=float, default=0.04,
-                        help="Edge mínimo para notificar (default: 0.04 = 4%%)")
+    parser.add_argument("--interval", type=int,   default=SCAN_INTERVAL)
+    parser.add_argument("--min-edge", type=float, default=0.04)
     parser.add_argument("--topics",   default=None,
-                        help="Temas separados por coma: elon,geopolitica,crypto,deportes")
+                        help="Temas: elon,geopolitica,crypto,deportes,politica_usa")
     args = parser.parse_args()
 
     if args.setup:

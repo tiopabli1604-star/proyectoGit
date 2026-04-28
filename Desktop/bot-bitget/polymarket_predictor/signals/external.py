@@ -188,6 +188,8 @@ _RSS_FEEDS = [
     "https://feeds.reuters.com/reuters/topNews",
     "https://feeds.bbci.co.uk/news/world/rss.xml",
     "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
 ]
 
 _POS_WORDS = {
@@ -259,6 +261,48 @@ def news_sentiment(topic_keywords: list[str], max_age_hours: int = 6) -> dict:
 
 # ── Resumen externo compuesto ─────────────────────────────────────────
 
+def crypto_news_sentiment(keywords: list[str]) -> dict:
+    """
+    CryptoPanic API gratuita — noticias cripto en tiempo real con sentimiento.
+    Solo útil para mercados de crypto.
+    """
+    is_crypto = any(k in keywords for k in
+                    ["bitcoin", "btc", "eth", "ethereum", "crypto",
+                     "solana", "xrp", "coinbase", "binance", "sol"])
+    if not is_crypto:
+        return {"score": 0.0, "count": 0}
+
+    cache_key = "cryptopanic"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        r = _SESSION.get("https://cryptopanic.com/api/free/v1/posts/",
+                         params={"auth_token": "free", "filter": "hot",
+                                 "currencies": "BTC,ETH,SOL"},
+                         timeout=8)
+        if r.status_code != 200:
+            return {"score": 0.0, "count": 0}
+        posts = r.json().get("results", [])[:20]
+        scores = []
+        for p in posts:
+            votes = p.get("votes", {})
+            pos = votes.get("positive", 0)
+            neg = votes.get("negative", 0)
+            if pos + neg > 0:
+                scores.append((pos - neg) / (pos + neg))
+        result = {
+            "score": round(sum(scores) / len(scores), 3) if scores else 0.0,
+            "count": len(posts),
+        }
+    except Exception:
+        result = {"score": 0.0, "count": 0}
+
+    _cache_set(cache_key, result)
+    return result
+
+
 _kalshi  = KalshiSignal()
 _manifold = ManifoldSignal()
 
@@ -313,10 +357,21 @@ def get_external_signal(question: str,
     except Exception as e:
         logger.debug(f"Kalshi error: {e}")
 
-    # News sentiment (señal de dirección pero no magnitud)
+    # News RSS + CryptoPanic
     if topic_keywords:
         try:
-            result["news"] = news_sentiment(topic_keywords[:4])
+            rss = news_sentiment(topic_keywords[:4])
+            crypto = crypto_news_sentiment(topic_keywords)
+            # Combina ambas señales
+            if crypto["count"] > 0:
+                combined_score = rss["score"] * 0.4 + crypto["score"] * 0.6
+                result["news"] = {
+                    "score": round(combined_score, 3),
+                    "count": rss["count"] + crypto["count"],
+                    "headlines": rss.get("headlines", []),
+                }
+            else:
+                result["news"] = rss
         except Exception as e:
             logger.debug(f"News error: {e}")
 

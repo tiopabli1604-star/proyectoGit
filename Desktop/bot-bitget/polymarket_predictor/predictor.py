@@ -21,6 +21,7 @@ from api.client import PolymarketClient
 from signals.orderflow import orderflow_score, market_freshness
 from signals.momentum import momentum_score
 from signals.external import get_external_signal
+from signals.base_rates import get_calibration_curve, apply_base_rate
 from models.bayesian import BayesianUpdater
 from models.calibration import calibrate_probability, liquidity_adjustment
 from models.ensemble import EnsembleModel, SignalBundle, Prediction
@@ -85,10 +86,11 @@ class PolymarketPredictor:
     """Predictor principal. Analiza mercados y genera recomendaciones."""
 
     def __init__(self, bankroll: float = 1000.0):
-        self.client   = PolymarketClient()
-        self.ensemble = EnsembleModel()
-        self.bankroll = bankroll
-        self._exposure = 0.0
+        self.client      = PolymarketClient()
+        self.ensemble    = EnsembleModel()
+        self.bankroll    = bankroll
+        self._exposure   = 0.0
+        self._base_rates = get_calibration_curve()   # cargado al inicio, caché 24h
 
     # ------------------------------------------------------------------
     # API pública
@@ -243,6 +245,8 @@ class PolymarketPredictor:
         # ---- Calibración ----
         calibrated_price = calibrate_probability(mid_price, market_type)
         calibrated_price = liquidity_adjustment(calibrated_price, spread, volume_24h)
+        # Aplica corrección histórica de base rates
+        calibrated_price = apply_base_rate(calibrated_price, self._base_rates)
 
         # ---- Ensemble ----
         signals = SignalBundle(
