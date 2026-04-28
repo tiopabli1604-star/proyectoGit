@@ -218,19 +218,35 @@ def _parse_rss_headlines(feed_url: str) -> list[str]:
     return [t.strip() for t in titles[2:20]]  # salta el título del feed
 
 
-def news_sentiment(topic_keywords: list[str], max_age_hours: int = 6) -> dict:
+def news_sentiment(topic_keywords: list[str], question: str = "",
+                   max_age_hours: int = 48) -> dict:
     """
-    Busca noticias recientes relacionadas con las keywords del mercado.
-    Retorna {'score': float [-1,1], 'headlines': list, 'count': int}
-
-    score > 0 → noticias positivas para YES
-    score < 0 → noticias negativas para YES
+    Analiza noticias recientes con NLP avanzado (VADER + TF-IDF).
+    Retorna {'score': float [-1,1], 'headlines': list, 'count': int, 'confidence': float}
     """
-    cache_key = f"news_{'_'.join(sorted(topic_keywords[:3]))}"
+    cache_key = f"news_nlp_{'_'.join(sorted(topic_keywords[:3]))}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
+    try:
+        from signals.nlp import analyze_market_news
+        result = analyze_market_news(
+            question=question or " ".join(topic_keywords),
+            topic_keywords=topic_keywords,
+            max_age_hours=max_age_hours,
+        )
+    except Exception as e:
+        logger.debug(f"NLP news error, usando fallback: {e}")
+        # Fallback al sistema anterior si NLP falla
+        result = _news_sentiment_fallback(topic_keywords)
+
+    _cache_set(cache_key, result)
+    return result
+
+
+def _news_sentiment_fallback(topic_keywords: list[str]) -> dict:
+    """Sistema de sentiment anterior como fallback."""
     kw_lower = [k.lower() for k in topic_keywords]
     matched_headlines = []
     sentiment_scores = []
@@ -244,19 +260,15 @@ def news_sentiment(topic_keywords: list[str], max_age_hours: int = 6) -> dict:
                 words = set(h_lower.split())
                 pos = len(words & _POS_WORDS)
                 neg = len(words & _NEG_WORDS)
-                if pos + neg > 0:
-                    sentiment_scores.append((pos - neg) / (pos + neg))
-                else:
-                    sentiment_scores.append(0.0)
+                sentiment_scores.append((pos - neg) / max(pos + neg, 1))
 
     score = float(sum(sentiment_scores) / len(sentiment_scores)) if sentiment_scores else 0.0
-    result = {
-        "score":     round(score, 3),
-        "headlines": matched_headlines[:5],
-        "count":     len(matched_headlines),
+    return {
+        "score":      round(score, 3),
+        "headlines":  matched_headlines[:5],
+        "count":      len(matched_headlines),
+        "confidence": 0.3,
     }
-    _cache_set(cache_key, result)
-    return result
 
 
 # ── Resumen externo compuesto ─────────────────────────────────────────
@@ -357,18 +369,19 @@ def get_external_signal(question: str,
     except Exception as e:
         logger.debug(f"Kalshi error: {e}")
 
-    # News RSS + CryptoPanic
+    # News con NLP avanzado + CryptoPanic para crypto
     if topic_keywords:
         try:
-            rss = news_sentiment(topic_keywords[:4])
+            rss = news_sentiment(topic_keywords[:5], question=question)
             crypto = crypto_news_sentiment(topic_keywords)
-            # Combina ambas señales
             if crypto["count"] > 0:
                 combined_score = rss["score"] * 0.4 + crypto["score"] * 0.6
+                combined_conf  = rss.get("confidence", 0.3) * 0.4 + 0.5 * 0.6
                 result["news"] = {
-                    "score": round(combined_score, 3),
-                    "count": rss["count"] + crypto["count"],
-                    "headlines": rss.get("headlines", []),
+                    "score":      round(combined_score, 3),
+                    "count":      rss["count"] + crypto["count"],
+                    "headlines":  rss.get("headlines", []),
+                    "confidence": round(combined_conf, 3),
                 }
             else:
                 result["news"] = rss

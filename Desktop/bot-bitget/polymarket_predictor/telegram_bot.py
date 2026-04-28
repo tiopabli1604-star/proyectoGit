@@ -162,6 +162,15 @@ def _tiempo_restante(days_left):
         return f"🟢 {d/30:.1f} meses"
 
 
+_CAT_EMOJI = {
+    "crypto":     "🪙",
+    "elecciones": "🗳️",
+    "politica":   "🏛️",
+    "finanzas":   "📊",
+    "default":    "🔍",
+}
+
+
 def _format_alert(analysis, rank: int) -> str:
     p      = analysis.prediction
     t      = _tiempo_restante(analysis.days_left)
@@ -172,30 +181,53 @@ def _format_alert(analysis, rank: int) -> str:
     ganancia_10 = round(10 / precio_entrada - 10, 2) if precio_entrada > 0 else 0
     edge_stars  = "⭐" * min(5, max(1, int(abs(p.edge) * 20)))
 
-    # Señales externas
-    ext  = getattr(analysis, "external", {})
+    # Categoría
+    ext      = getattr(analysis, "external", {})
+    category = ext.get("category", "default")
+    cat_emoji = _CAT_EMOJI.get(category, "🔍")
+
+    # Señales externas (Kalshi / Manifold)
     kal  = ext.get("kalshi")
     mani = ext.get("manifold")
     ext_line = ""
     if kal and kal.get("prob") is not None:
-        ext_line += f"\n🏛 Kalshi: <b>{kal['prob']:.0%}</b>  (similitud {kal['similarity']:.0%})"
+        ext_line += f"\n🏛 Kalshi: <b>{kal['prob']:.0%}</b> (sim {kal['similarity']:.0%})"
     if mani and mani.get("prob") is not None:
-        ext_line += f"\n🔀 Manifold: <b>{mani['prob']:.0%}</b>  (similitud {mani['similarity']:.0%})"
+        ext_line += f"\n🔀 Manifold: <b>{mani['prob']:.0%}</b> (sim {mani['similarity']:.0%})"
 
+    # Correlación cruzada
+    cross = ext.get("cross_market", {})
+    cross_line = ""
+    if cross.get("correlated_prob") is not None and cross.get("n_correlated", 0) > 0:
+        cp = cross["correlated_prob"]
+        n  = cross["n_correlated"]
+        arrow = "▲" if cp > p.market_price else "▼"
+        cross_line = f"\n🔗 Correlatos ({n}): <b>{cp:.0%}</b> {arrow}"
+
+    # ML
+    ml_prob = ext.get("ml_prob")
+    ml_line = ""
+    if ml_prob is not None:
+        diff = ml_prob - p.market_price
+        ml_line = f"\n🤖 ML: <b>{ml_prob:.0%}</b> ({diff:+.0%} vs mercado)"
+
+    # Noticias NLP
     news = ext.get("news", {})
     news_line = ""
     if news.get("count", 0) > 0:
-        s = news["score"]
-        emoji = "📰+" if s > 0.1 else ("📰-" if s < -0.1 else "📰")
-        news_line = f"\n{emoji} {news['count']} noticia(s) reciente(s)"
+        s    = news["score"]
+        conf = news.get("confidence", 0)
+        emoji = "📰+" if s > 0.1 else ("📰-" if s < -0.1 else "📰~")
+        news_line = (f"\n{emoji} {news['count']} artículo(s)  "
+                     f"sentimiento: <b>{s:+.2f}</b>  conf: {conf:.0%}")
 
     return (
         f"{'━'*38}\n"
-        f"<b>#{rank} {analysis.question[:80]}</b>\n"
+        f"{cat_emoji} <b>#{rank} {analysis.question[:75]}</b>\n"
         f"📅 Cierra: {cierre}  {t}\n"
-        f"\n💲 Mercado: <b>{p.market_price:.0%}</b>  →  Estimación: <b>{p.probability:.0%}</b>"
-        f"{ext_line}{news_line}\n"
-        f"📈 Edge: <b>{p.edge:+.0%}</b>  Confianza: <b>{p.confidence:.0%}</b>  {edge_stars}\n"
+        f"\n💲 Mercado: <b>{p.market_price:.0%}</b>  →  Estimado: <b>{p.probability:.0%}</b>"
+        f"{ext_line}{cross_line}{ml_line}{news_line}\n"
+        f"📈 Edge: <b>{p.edge:+.0%}</b>  Conf: <b>{p.confidence:.0%}</b>  {edge_stars}\n"
         f"🎯 Acción: <b>{accion} @ {precio_entrada:.2f}</b>\n"
         f"💵 Con $10 ganarías: <b>${ganancia_10:.2f}</b>  (ROI: {analysis.ev['roi']:.0%})\n"
         f"🆔 <code>{analysis.condition_id[:20]}...</code>\n"

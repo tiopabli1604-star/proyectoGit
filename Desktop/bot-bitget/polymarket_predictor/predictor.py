@@ -22,9 +22,12 @@ from signals.orderflow import orderflow_score, market_freshness
 from signals.momentum import momentum_score
 from signals.external import get_external_signal
 from signals.base_rates import get_calibration_curve, apply_base_rate
+from signals.category_calibration import categorize_market, calibrate_by_category
+from signals.cross_market import cross_market_analyzer
 from models.bayesian import BayesianUpdater
 from models.calibration import calibrate_probability, liquidity_adjustment
 from models.ensemble import EnsembleModel, SignalBundle, Prediction
+from models.ml_predictor import get_ml_predictor
 from risk.kelly import position_size, expected_value, PositionSize
 from config import MIN_LIQUIDITY_USD, MIN_VOLUME_24H, MAX_SPREAD_PCT, EDGE_THRESHOLD
 
@@ -92,6 +95,12 @@ class PolymarketPredictor:
         self._exposure   = 0.0
         self._base_rates = get_calibration_curve()   # cargado al inicio, caché 24h
 
+        # Inicia entrenamiento ML en background (no bloquea el arranque)
+        import threading
+        ml = get_ml_predictor()
+        t = threading.Thread(target=ml.load_or_train, daemon=True)
+        t.start()
+
     # ------------------------------------------------------------------
     # API pública
     # ------------------------------------------------------------------
@@ -106,6 +115,13 @@ class PolymarketPredictor:
             logger.info(f"Paginación completa: {len(markets)} mercados con keywords {keywords}")
         else:
             markets = self.client.get_markets(limit=limit)
+
+        # Construye índice de correlación cruzada con todos los mercados del escaneo
+        try:
+            cross_market_analyzer.build_index(markets)
+            logger.debug("Índice de correlación cruzada construido")
+        except Exception as e:
+            logger.debug(f"No se pudo construir índice cross-market: {e}")
 
         results = []
         for mkt in markets:
@@ -202,51 +218,98 @@ class PolymarketPredictor:
             logger.debug(f"SKIP {condition_id}: liquidez ${liquidity:.0f}, vol24h ${volume_24h:.0f}")
             return None
 
+        # ---- Categoría del mercado ----
+        category = categorize_market(question)
+
         # ---- Señales internas ----
         of_score   = orderflow_score(orderbook, trades) if trades else 0.5
         mom_score  = momentum_score(trades, end_date) if trades else 0.5
         freshness  = market_freshness(trades)   # 0 = dormido, 1 = activo
 
-        # ---- Señales externas (Metaculus, Manifold, noticias) ----
+        # ---- Señales externas (Manifold, Kalshi, noticias NLP) ----
         topic_kw = [w for w in question.lower().split()
                     if len(w) > 3 and w not in {
                         "will", "does", "have", "been", "that", "with",
                         "this", "from", "they", "what", "when", "which",
-                        "2024", "2025", "2026", "2027"}][:5]
+                        "2024", "2025", "2026", "2027"}][:6]
         ext = get_external_signal(question, topic_keywords=topic_kw)
-        external_prob   = ext.get("external_prob")
-        external_weight = ext.get("source_weight", 0.0)
-        news_score_raw  = ext.get("news", {}).get("score", 0.0)
+        external_prob    = ext.get("external_prob")
+        external_weight  = ext.get("source_weight", 0.0)
+        news_score_raw   = ext.get("news", {}).get("score", 0.0)
+        news_confidence  = ext.get("news", {}).get("confidence", 0.3)
         # Convierte news score [-1,1] a [0,1]
         news_signal = (news_score_raw + 1) / 2
 
+        # ---- Correlación cruzada entre mercados ----
+        cross_signal = {}
+        try:
+            cross_signal = cross_market_analyzer.get_signal(
+                question=question,
+                market_price=mid_price,
+                condition_id=condition_id,
+            )
+        except Exception:
+            pass
+        cross_prob       = cross_signal.get("correlated_prob")
+        cross_confidence = cross_signal.get("confidence", 0.0)
+        cross_contradiction = cross_signal.get("contradiction", False)
+
+        # ---- Predicción ML ----
+        ml_prob = None
+        try:
+            ml = get_ml_predictor()
+            if ml.is_ready:
+                ml_prob = ml.predict(
+                    market_price=mid_price,
+                    category=category,
+                    volume_24h=volume_24h,
+                    liquidity=liquidity,
+                    spread=spread,
+                    days_left=dl,
+                    orderflow=of_score,
+                    momentum=mom_score,
+                )
+        except Exception:
+            pass
+
         # ---- Actualización Bayesiana ----
-        # La prior parte del precio de mercado.
-        # Señales internas tienen peso bajo (mercado ya las incorpora).
-        # Señal externa (Metaculus) tiene peso muy alto si hay buen match.
         updater = BayesianUpdater(prior_price=mid_price, concentration=10.0)
 
         signals_dict = {
             "orderflow": (of_score,  1.0),
             "momentum":  (mom_score, 0.8),
         }
-        if news_score_raw != 0.0:
-            signals_dict["news"] = (news_signal, 0.6)
+        # Noticias: peso según confianza del análisis NLP
+        if abs(news_score_raw) > 0.05 and news_confidence > 0.2:
+            news_strength = 0.4 + news_confidence * 1.2   # 0.4 – 1.48
+            signals_dict["news"] = (news_signal, news_strength)
 
+        # Señal externa (Manifold/Kalshi): peso por similitud
         if external_prob is not None and external_weight > 0.2:
-            # Metaculus/Manifold: peso proporcional a la similaridad de la pregunta
-            ext_strength = external_weight * 4.0   # hasta 3.2 de fuerza
+            ext_strength = external_weight * 4.0
             signals_dict["external"] = (external_prob, ext_strength)
+
+        # Correlación cruzada: señal independiente de mercados relacionados
+        if cross_prob is not None and cross_confidence > 0.3 and not cross_contradiction:
+            cross_strength = cross_confidence * 2.5
+            signals_dict["cross_market"] = (cross_prob, cross_strength)
+
+        # Predicción ML: señal adicional si está disponible
+        if ml_prob is not None:
+            signals_dict["ml"] = (ml_prob, 1.5)
 
         updater.update_with_multiple(signals_dict)
         bayes_prob  = updater.probability
         uncertainty = updater.uncertainty
 
-        # ---- Calibración ----
+        # ---- Calibración por categoría ----
         calibrated_price = calibrate_probability(mid_price, market_type)
         calibrated_price = liquidity_adjustment(calibrated_price, spread, volume_24h)
-        # Aplica corrección histórica de base rates
         calibrated_price = apply_base_rate(calibrated_price, self._base_rates)
+        # Calibración específica a la categoría del mercado
+        calibrated_price, cat_confidence = calibrate_by_category(
+            calibrated_price, category, dl
+        )
 
         # ---- Ensemble ----
         signals = SignalBundle(
@@ -261,15 +324,25 @@ class PolymarketPredictor:
         )
         prediction = self.ensemble.predict(signals)
 
-        # Mercados dormidos tienen precios más stale → subimos confianza si hay edge
+        # Aplica ajuste de confianza de la categoría
+        adjusted_confidence = min(0.95, prediction.confidence * cat_confidence)
+
+        # Mercados dormidos con edge: ligero boost de confianza
         if freshness < 0.3 and abs(prediction.edge) > 0.05:
+            adjusted_confidence = min(0.95, adjusted_confidence * 1.1)
+
+        # Si hay contradicción en cross-market: penaliza confianza
+        if cross_contradiction:
+            adjusted_confidence = adjusted_confidence * 0.75
+
+        if adjusted_confidence != prediction.confidence:
             prediction = Prediction(
                 probability  = prediction.probability,
                 market_price = prediction.market_price,
                 edge         = prediction.edge,
                 ci_lower     = prediction.ci_lower,
                 ci_upper     = prediction.ci_upper,
-                confidence   = min(prediction.confidence * 1.1, 0.95),
+                confidence   = adjusted_confidence,
                 signals      = prediction.signals,
             )
 
@@ -289,6 +362,15 @@ class PolymarketPredictor:
             pos.usd_amount > 0
         )
 
+        # Enriquece el dict de señales externas con cross-market y ML
+        ext_enriched = {
+            **ext,
+            "category":          category,
+            "cross_market":      cross_signal if cross_signal else {},
+            "ml_prob":           ml_prob,
+            "cat_confidence":    cat_confidence,
+        }
+
         return MarketAnalysis(
             condition_id   = condition_id,
             question       = question,
@@ -299,7 +381,7 @@ class PolymarketPredictor:
             ev             = ev,
             bayesian       = updater.summary(),
             is_opportunity = is_opportunity,
-            external       = ext,
+            external       = ext_enriched,
         )
 
 
