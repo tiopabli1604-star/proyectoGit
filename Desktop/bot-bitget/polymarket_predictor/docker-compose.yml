@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  monitor:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data          # notified_markets.json y logs persisten aquí
+    command: >
+      python telegram_bot.py
+      --monitor
+      --bankroll ${BANKROLL:-1000}
+      --min-edge ${MIN_EDGE:-0.04}
+      --topics ${TOPICS:-elon,geopolitica,deportes,crypto}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

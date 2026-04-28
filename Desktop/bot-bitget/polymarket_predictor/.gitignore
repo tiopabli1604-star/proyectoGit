@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+notified_markets.json
+model_cache/
+data/
+*.log
