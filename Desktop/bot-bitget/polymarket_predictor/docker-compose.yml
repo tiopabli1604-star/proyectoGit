@@ -14,7 +14,7 @@ services:
       --monitor
       --bankroll ${BANKROLL:-1000}
       --min-edge ${MIN_EDGE:-0.04}
-      --topics ${TOPICS:-elon,geopolitica,deportes,crypto}
+      --topics ${TOPICS:-politica,elecciones,finanzas,crypto}
     logging:
       driver: "json-file"
       options:

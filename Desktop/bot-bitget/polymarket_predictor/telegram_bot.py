@@ -227,33 +227,44 @@ def _is_new_opportunity(condition_id: str, edge: float, seen: dict) -> bool:
 # ── Topics / Keywords ────────────────────────────────────────────────
 
 TOPICS = {
-    "elon": [
-        "elon", "musk", "tesla", "spacex", "doge", "dogecoin",
-        "x.com", "twitter", "grok", "xai", "neuralink", "starlink",
-        "department of government", "doge cut", "boring company",
-        "tweets", "tweet count", "posts april", "posts may",
+    "politica": [
+        "trump", "biden", "harris", "congress", "senate", "house",
+        "republican", "democrat", "president", "supreme court",
+        "white house", "executive order", "ukraine", "russia",
+        "ceasefire", "war", "nato", "china", "taiwan", "iran",
+        "israel", "gaza", "sanctions", "tariff", "tariffs",
+        "trade war", "xi jinping", "putin", "zelensky",
+        "kim jong", "north korea", "middle east", "eu", "europe",
+        "parliament", "minister", "government", "coup", "protest",
     ],
-    "geopolitica": [
-        "ukraine", "russia", "ceasefire", "war", "nato", "china",
-        "taiwan", "iran", "israel", "gaza", "trump", "sanctions",
-        "tariff", "tariffs", "trade war", "xi jinping", "putin",
-        "zelensky", "kim jong", "north korea", "middle east",
+    "elecciones": [
+        "election", "vote", "voting", "ballot", "polls", "poll",
+        "candidate", "primary", "runoff", "referendum", "majority",
+        "win the election", "presidential", "congressional",
+        "senate race", "gubernatorial", "party", "margin",
+        "swing state", "approval rating", "incumbent",
+        "germany election", "france election", "uk election",
+        "mexico election", "brazil election", "india election",
+        "japan election", "korea election", "australia election",
+    ],
+    "finanzas": [
+        "fed", "federal reserve", "interest rate", "rate cut",
+        "rate hike", "inflation", "cpi", "gdp", "recession",
+        "stock market", "s&p", "sp500", "nasdaq", "dow jones",
+        "earnings", "ipo", "bonds", "treasury", "yield",
+        "dollar", "euro", "yen", "oil", "gold", "silver",
+        "housing", "unemployment", "jobs report", "payroll",
+        "hedge fund", "bank", "jpmorgan", "goldman", "blackrock",
+        "imf", "world bank", "debt ceiling", "budget deficit",
     ],
     "crypto": [
         "bitcoin", "ethereum", "btc", "eth", "crypto", "solana",
         "xrp", "coinbase", "binance", "sol", "defi", "nft",
         "altcoin", "stablecoin", "sec crypto", "etf bitcoin",
-    ],
-    "deportes": [
-        "nba", "nfl", "nhl", "stanley cup", "super bowl",
-        "championship", "world cup", "wimbledon", "ufc",
-        "formula 1", "f1", "lakers", "warriors", "celtics",
-        "playoffs", "finals", "champion",
-    ],
-    "politica_usa": [
-        "trump", "biden", "harris", "congress", "senate", "house",
-        "republican", "democrat", "election", "vote", "president",
-        "supreme court", "white house", "executive order",
+        "ripple", "cardano", "ada", "matic", "polygon", "avalanche",
+        "avax", "chainlink", "link", "doge", "dogecoin", "shiba",
+        "crypto regulation", "bitcoin etf", "crypto market",
+        "blockchain", "web3", "token", "airdrop", "halving",
     ],
 }
 
@@ -283,6 +294,114 @@ def _detect_contradictions(opportunities: list) -> set:
     return flagged
 
 
+# ── Apuestas seguras (mercados al 85-97%) ────────────────────────────
+
+def _format_sure_bet(mkt: dict, rank: int) -> str:
+    """Formatea una apuesta de alta probabilidad para Telegram."""
+    question = mkt["question"][:80]
+    price    = mkt["price"]
+    side     = mkt["side"]
+    roi      = mkt["roi"]
+    days     = mkt["days_left"]
+    vol      = mkt["volume"]
+    liq      = mkt["liquidity"]
+
+    if days is None:
+        tiempo = "Sin fecha"
+    elif days < 1:
+        tiempo = f"⏰ {days*24:.0f}h"
+    elif days < 7:
+        tiempo = f"🔴 {days:.1f} días"
+    elif days < 30:
+        tiempo = f"🟡 {days/7:.1f} semanas"
+    else:
+        tiempo = f"🟢 {days/30:.1f} meses"
+
+    profit_10 = round(10 * roi, 2)
+
+    return (
+        f"{'━'*38}\n"
+        f"<b>#{rank} {question}</b>\n"
+        f"⏳ Cierra en: {tiempo}\n"
+        f"\n✅ Probabilidad: <b>{price:.0%}</b>  →  Apuesta: <b>{side}</b>\n"
+        f"💰 ROI: <b>+{roi:.1%}</b>  |  Con $10 ganarías: <b>${profit_10:.2f}</b>\n"
+        f"📊 Volumen: ${vol:,.0f}  |  Liquidez: ${liq:,.0f}\n"
+    )
+
+
+def _scan_sure_bets(client, keywords: list = None, max_pages: int = 20) -> list[dict]:
+    """
+    Busca mercados donde el precio del consenso es 85-97%:
+    prácticamente seguro pero con ROI decente.
+    """
+    try:
+        markets = client.get_all_markets(keywords=keywords, max_pages=max_pages)
+    except Exception as e:
+        logger.error(f"Error obteniendo mercados para sure bets: {e}")
+        return []
+
+    sure_bets = []
+    for mkt in markets:
+        try:
+            prices = mkt.get("outcomePrices", [])
+            if isinstance(prices, str):
+                import json as _j
+                try:
+                    prices = _j.loads(prices)
+                except Exception:
+                    prices = []
+            if not prices:
+                continue
+            yes_price = float(prices[0])
+
+            # Rango óptimo: 85-97% (suficiente ROI, sin demasiado riesgo residual)
+            if 0.85 <= yes_price <= 0.97:
+                price, side = yes_price, "BUY YES"
+            elif 0.03 <= yes_price <= 0.15:
+                price, side = 1 - yes_price, "BUY NO"
+            else:
+                continue
+
+            volume  = float(mkt.get("volume24hr") or mkt.get("volume24hrClob") or 0)
+            liq     = float(mkt.get("liquidity") or mkt.get("liquidityClob") or 0)
+
+            # Solo mercados líquidos
+            if liq < 300 and volume < 200:
+                continue
+
+            end_date = mkt.get("endDate") or mkt.get("endDateIso") or mkt.get("end_date_iso")
+            dl = _days_left(end_date)
+            if dl is not None and dl <= 0:
+                continue
+
+            # Máximo 90 días (más lejos hay mucho tiempo para sorpresas)
+            if dl is not None and dl > 90:
+                continue
+
+            roi = (1.0 / price) - 1.0
+
+            # Score: liquidez + ROI + urgencia temporal
+            days_factor = 1.0 / (dl + 1) if dl else 0.01
+            score = liq * roi * (1 + days_factor)
+
+            sure_bets.append({
+                "question":    mkt.get("question", "?"),
+                "price":       price,
+                "side":        side,
+                "roi":         roi,
+                "days_left":   dl,
+                "volume":      volume,
+                "liquidity":   liq,
+                "score":       score,
+                "condition_id": mkt.get("conditionId") or mkt.get("condition_id", ""),
+            })
+        except Exception:
+            continue
+
+    sure_bets.sort(key=lambda x: x["score"], reverse=True)
+    return sure_bets[:10]
+
+
 # ── Comandos Telegram (bidireccional) ────────────────────────────────
 
 def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
@@ -298,8 +417,9 @@ def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
         return (
             "🤖 <b>PolyiClaude Bot — Comandos</b>\n\n"
             "📊 <b>Análisis</b>\n"
-            "/scan — escaneo inmediato\n"
-            "/top  — top 5 oportunidades ahora\n\n"
+            "/scan — escaneo inmediato (edge alto)\n"
+            "/top  — top 5 oportunidades ahora\n"
+            "/sure — apuestas seguras 85-97% (bajo riesgo)\n\n"
             "💼 <b>Posiciones</b>\n"
             "/pos  — ver P&amp;L de tus apuestas\n"
             "/add &lt;id&gt; &lt;YES|NO&gt; &lt;precio&gt; &lt;$&gt;\n"
@@ -309,6 +429,23 @@ def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
             "/balance — ver USDC disponible\n\n"
             "🌐 Dashboard: http://187.33.156.155:8080"
         )
+
+    elif cmd == "/sure":
+        try:
+            bets = _scan_sure_bets(predictor.client, keywords=topics_kw or None)
+            if not bets:
+                return "🔍 Sin apuestas seguras disponibles ahora mismo (85-97%)."
+            lines = [f"🔒 <b>Apuestas seguras — alta probabilidad</b>\n"
+                     f"Mercados al 85-97% con buena liquidez\n"]
+            for i, b in enumerate(bets[:6], 1):
+                lines.append(_format_sure_bet(b, i))
+            lines.append(
+                "\n⚠️ <i>Aunque la probabilidad es alta, nunca es 100%.\n"
+                "Diversifica y no pongas todo en una sola apuesta.</i>"
+            )
+            return "\n".join(lines)[:4000]
+        except Exception as e:
+            return f"❌ Error: {e}"
 
     elif cmd == "/pos":
         return format_positions_message()
@@ -572,16 +709,17 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
         f"🚀 <b>Monitor iniciado</b>\n"
         f"Temas: {topics_str} | Cada {interval//60} min | "
         f"Edge mínimo: {min_edge:.0%} | Bankroll: ${bankroll:.0f}\n\n"
-        f"Comandos: /scan /top /pos /add /help"
+        f"Comandos: /scan /top /sure /pos /add /help"
     ))
 
     logger.info(f"Monitor activo — intervalo {interval}s, topics: {topics_str}")
 
-    scan_count      = 0
-    update_offset   = 0
-    last_summary    = ""
-    best_today: list = []
-    last_cmd_check  = 0
+    scan_count         = 0
+    update_offset      = 0
+    last_summary       = ""
+    best_today: list   = []
+    last_cmd_check     = 0
+    seen_sure_bets: set = set()   # condition_ids ya notificados como sure bets
 
     while True:
         # ── Comandos Telegram (cada 30s) ──
@@ -617,6 +755,30 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                 send_message(CHAT_ID, alert_msg)
         except Exception as e:
             logger.debug(f"Error checking positions: {e}")
+
+        # ── Sure bets automáticas (cada 3 escaneos = cada 45 min) ──
+        if scan_count % 3 == 0:
+            try:
+                sure_bets = _scan_sure_bets(predictor.client, keywords=kw)
+                nuevas_sure = [b for b in sure_bets
+                               if b["condition_id"] not in seen_sure_bets]
+                if nuevas_sure:
+                    lines = [
+                        f"🔒 <b>Apuestas seguras detectadas</b>  •  "
+                        f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+                        f"Mercados al 85-97% — bajo riesgo, volumen para acumular\n"
+                    ]
+                    for i, b in enumerate(nuevas_sure[:5], 1):
+                        lines.append(_format_sure_bet(b, i))
+                        seen_sure_bets.add(b["condition_id"])
+                    lines.append(
+                        "\n⚠️ <i>Alta probabilidad no es certeza. "
+                        "Diversifica tus posiciones.</i>"
+                    )
+                    send_message(CHAT_ID, "\n".join(lines)[:4000])
+                    logger.info(f"Enviadas {len(nuevas_sure)} sure bets")
+            except Exception as e:
+                logger.debug(f"Error en sure bets: {e}")
 
         # ── Force scan desde dashboard ──
         if Path("force_scan.flag").exists():
