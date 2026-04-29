@@ -451,11 +451,14 @@ def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
             "📊 <b>Análisis</b>\n"
             "/scan — escaneo inmediato (edge alto)\n"
             "/top  — top 5 oportunidades ahora\n"
-            "/sure — apuestas seguras 85-97% (bajo riesgo)\n\n"
+            "/sure — apuestas seguras 85-97%\n\n"
             "💼 <b>Posiciones</b>\n"
             "/pos  — ver P&amp;L de tus apuestas\n"
             "/add &lt;id&gt; &lt;YES|NO&gt; &lt;precio&gt; &lt;$&gt;\n"
             "/remove &lt;id&gt; — eliminar posición\n\n"
+            "📈 <b>Performance</b>\n"
+            "/stats    — estadísticas del bot\n"
+            "/backtest — backtest en datos históricos\n\n"
             "💸 <b>Trading automático</b>\n"
             "/buy &lt;id&gt; &lt;YES|NO&gt; &lt;$&gt; — ejecutar orden\n"
             "/balance — ver USDC disponible\n\n"
@@ -626,6 +629,34 @@ def _handle_command(text: str, predictor, seen: dict, topics_kw: list,
         except Exception as e:
             return f"❌ Error: {e}"
 
+    elif cmd == "/stats":
+        try:
+            from database.db import db_get_portfolio_summary, db_get_scan_stats, db_get_opportunity_stats
+            summary = db_get_portfolio_summary()
+            opp_stats = db_get_opportunity_stats()
+            return (
+                f"📊 <b>Estadísticas del bot</b>\n\n"
+                f"<b>Portafolio</b>\n"
+                f"  Posiciones abiertas: {summary['positions_open']}\n"
+                f"  P&L total: <b>{summary['total_pnl']:+.2f}$</b> ({summary['total_pnl_pct']:+.1f}%)\n"
+                f"  Invertido: ${summary['total_invested']:.2f}\n"
+                f"  Win rate: {summary['win_rate']}%\n\n"
+                f"<b>Escaneos</b>\n"
+                f"  Total escaneos: {summary['scan_count']}\n"
+                f"  Mercados analizados: {summary['markets_tracked']:,}\n"
+                f"  Oportunidades (7d): {opp_stats.get('total', 0)}\n"
+                f"  Edge medio (7d): {(opp_stats.get('avg_edge') or 0):.1%}\n"
+            )
+        except Exception as e:
+            return f"❌ Error obteniendo stats: {e}"
+
+    elif cmd == "/backtest":
+        return (
+            "⏳ <b>Backtest iniciado</b>\n\n"
+            "Analizando 300 mercados resueltos de Polymarket...\n"
+            "Este proceso tarda ~2 minutos. Te envío los resultados cuando acabe."
+        )
+
     return f"❓ Comando no reconocido: {cmd}\nEscribe /help para ver los comandos."
 
 
@@ -727,8 +758,18 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
     except Exception as e:
         logger.warning(f"Dashboard no disponible: {e}")
 
+    # Inicializa base de datos SQLite
+    from database.db import init_db, db_is_notified, db_mark_notified, db_log_scan, db_save_opportunity
+    try:
+        init_db()
+        logger.info("Base de datos SQLite inicializada")
+    except Exception as e:
+        logger.warning(f"Error inicializando DB: {e}")
+
     predictor = PolymarketPredictor(bankroll=bankroll)
-    seen      = _load_seen()
+
+    # Compatibilidad: seen sigue en memoria pero se sincroniza con DB
+    seen = {}
 
     kw = None
     if topics:
@@ -746,12 +787,13 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
 
     logger.info(f"Monitor activo — intervalo {interval}s, topics: {topics_str}")
 
-    scan_count         = 0
-    update_offset      = 0
-    last_summary       = ""
-    best_today: list   = []
-    last_cmd_check     = 0
-    seen_sure_bets: set = set()   # condition_ids ya notificados como sure bets
+    scan_count          = 0
+    update_offset       = 0
+    last_summary        = ""
+    best_today: list    = []
+    last_cmd_check      = 0
+    seen_sure_bets: set = set()
+    _backtest_running   = False   # evita lanzar dos backtests simultáneos
 
     while True:
         # ── Comandos Telegram (cada 30s) ──
@@ -770,6 +812,20 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                             text, predictor, seen, kw or [],
                             market_type, min_edge)
                         send_message(CHAT_ID, resp)
+                        # Backtest se lanza en background para no bloquear
+                        if text.strip().lower() == "/backtest" and not _backtest_running:
+                            _backtest_running = True
+                            def _run_bt():
+                                nonlocal _backtest_running
+                                try:
+                                    from backtesting.engine import run_backtest, format_backtest_telegram
+                                    results = run_backtest(n_markets=300, bankroll=bankroll)
+                                    send_message(CHAT_ID, format_backtest_telegram(results))
+                                except Exception as e:
+                                    send_message(CHAT_ID, f"❌ Error en backtest: {e}")
+                                finally:
+                                    _backtest_running = False
+                            threading.Thread(target=_run_bt, daemon=True).start()
             except Exception as e:
                 logger.debug(f"Error checking commands: {e}")
 
@@ -820,17 +876,28 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
 
         # ── Escaneo de mercados (cada interval segundos) ──
         scan_count += 1
+        scan_start = time.time()
         try:
             logger.info(f"Escaneo #{scan_count}…")
 
-            if scan_count % 2 == 0:
-                raw_markets = predictor.client.get_all_events_markets(
-                    keywords=kw, max_pages=30)
-                logger.info(f"Via eventos: {len(raw_markets)} mercados")
-            else:
-                raw_markets = predictor.client.get_all_markets(
-                    keywords=kw, max_pages=20)
-                logger.info(f"Via mercados: {len(raw_markets)} mercados")
+            # Usa cliente asíncrono si aiohttp disponible, síncrono como fallback
+            use_events = (scan_count % 2 == 0)
+            try:
+                from api.async_client import run_async_fetch
+                raw_markets = run_async_fetch(keywords=kw, use_events=use_events,
+                                              max_pages=30 if use_events else 20)
+                if not raw_markets:
+                    raise ValueError("async retornó vacío")
+            except Exception:
+                if use_events:
+                    raw_markets = predictor.client.get_all_events_markets(
+                        keywords=kw, max_pages=30)
+                else:
+                    raw_markets = predictor.client.get_all_markets(
+                        keywords=kw, max_pages=20)
+
+            scan_type = "events" if use_events else "markets"
+            logger.info(f"[{scan_type}] {len(raw_markets)} mercados obtenidos")
 
             results = []
             for mkt in raw_markets:
@@ -856,30 +923,54 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
 
             nuevas = [
                 (i+1, m) for i, m in enumerate(opportunities)
-                if _is_new_opportunity(m.condition_id, m.prediction.edge, seen)
+                if not db_is_notified(m.condition_id, m.prediction.edge)
             ]
 
-            # Guarda oportunidades para el dashboard
+            # Guarda oportunidades en SQLite + JSON para el dashboard
+            opp_data = []
             try:
-                opp_data = [{
-                    "question":     m.question[:80],
-                    "market_price": m.prediction.market_price,
-                    "probability":  m.prediction.probability,
-                    "edge":         m.prediction.edge,
-                    "confidence":   m.prediction.confidence,
-                    "action":       m.prediction.recommendation,
-                    "closes_in":    _tiempo_restante(m.days_left),
-                    "condition_id": m.condition_id,
-                } for m in opportunities[:20]]
+                for m in opportunities[:20]:
+                    ext = getattr(m, "external", {})
+                    cross = ext.get("cross_market", {})
+                    opp_item = {
+                        "question":     m.question[:80],
+                        "market_price": m.prediction.market_price,
+                        "probability":  m.prediction.probability,
+                        "edge":         m.prediction.edge,
+                        "confidence":   m.prediction.confidence,
+                        "action":       m.prediction.recommendation,
+                        "closes_in":    _tiempo_restante(m.days_left),
+                        "condition_id": m.condition_id,
+                        "category":     ext.get("category", "default"),
+                        "ml_prob":      ext.get("ml_prob"),
+                        "cross_prob":   cross.get("correlated_prob"),
+                        "news_score":   ext.get("news", {}).get("score"),
+                        "score":        m.score,
+                    }
+                    opp_data.append(opp_item)
+                    db_save_opportunity(opp_item)
+
                 Path("last_opportunities.json").write_text(
                     json.dumps(opp_data, ensure_ascii=False)
                 )
                 from dashboard.app import _state as dash_state
-                dash_state["last_scan"]   = datetime.now(timezone.utc).isoformat()
-                dash_state["scan_count"]  = scan_count
+                dash_state["last_scan"]     = datetime.now(timezone.utc).isoformat()
+                dash_state["scan_count"]    = scan_count
                 dash_state["opportunities"] = opp_data
-            except Exception:
-                pass
+
+                # Registra el escaneo en la DB
+                scan_duration = time.time() - scan_start
+                db_log_scan(
+                    scan_number=scan_count,
+                    markets_fetched=len(raw_markets),
+                    markets_analyzed=len(results),
+                    opportunities_found=len(opportunities),
+                    sure_bets_found=0,
+                    scan_type=scan_type,
+                    duration_seconds=scan_duration,
+                )
+            except Exception as e:
+                logger.debug(f"Error guardando oportunidades: {e}")
 
             # Guarda las mejores del día para el resumen
             best_today = sorted(
@@ -896,10 +987,8 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                 bloques = [header]
                 for rank, analysis in nuevas[:MAX_ALERTS]:
                     bloques.append(_format_alert(analysis, rank))
-                    seen[analysis.condition_id] = {
-                        "edge":       round(analysis.prediction.edge, 4),
-                        "notified_at": datetime.now(timezone.utc).isoformat(),
-                    }
+                    db_mark_notified(analysis.condition_id, analysis.prediction.edge)
+                    seen[analysis.condition_id] = {"edge": round(analysis.prediction.edge, 4)}
 
                 full_msg = "\n".join(bloques)
                 if len(full_msg) > 4000:
@@ -908,7 +997,6 @@ def monitor(bankroll: float, limit: int, market_type: str, interval: int,
                 else:
                     send_message(CHAT_ID, full_msg)
 
-                _save_seen(seen)
                 logger.info(f"Enviadas {len(nuevas)} alertas")
             else:
                 logger.info(

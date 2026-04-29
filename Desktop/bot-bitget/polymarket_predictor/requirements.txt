@@ -10,3 +10,4 @@ httpx>=0.27.0
 flask>=3.0.0
 py-clob-client>=0.17.0
 vaderSentiment>=3.3.2
+aiohttp>=3.9.0

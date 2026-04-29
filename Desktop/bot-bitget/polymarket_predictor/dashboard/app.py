@@ -1,19 +1,16 @@
 """
-Dashboard web para PolyiClaude.
-Corre en el puerto 8080. Protegido con contraseña básica.
+Dashboard web para PolyiClaude — Nivel 2.
+Ahora lee directamente de SQLite para datos en tiempo real.
 
-Rutas:
-  /          → dashboard principal
-  /api/positions   → JSON con posiciones
-  /api/opportunities → JSON con últimas oportunidades
-  /api/stats        → estadísticas generales
-  /api/scan         → fuerza un escaneo inmediato
+Nuevas rutas:
+  /api/history      → historial completo de oportunidades
+  /api/backtest     → resultados del último backtest
+  /api/scan_history → historial de escaneos
 """
 
 import os
 import json
 import time
-import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from functools import wraps
@@ -26,11 +23,9 @@ load_dotenv()
 app = Flask(__name__)
 
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "polymarket2026")
-POSITIONS_FILE     = Path("positions.json")
-SEEN_FILE          = Path("notified_markets.json")
 OPPORTUNITIES_FILE = Path("last_opportunities.json")
+BACKTEST_FILE      = Path("data/backtest_results.json")
 
-# Estado compartido entre threads
 _state = {
     "last_scan":    None,
     "scan_count":   0,
@@ -39,7 +34,7 @@ _state = {
 }
 
 
-# ── Auth básica ──────────────────────────────────────────────────────
+# ── Auth ─────────────────────────────────────────────────────────────
 
 def require_auth(f):
     @wraps(f)
@@ -54,33 +49,15 @@ def require_auth(f):
     return decorated
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# ── Helper: intenta leer de SQLite, cae a JSON si no hay DB ──────────
 
-def _load_positions() -> dict:
-    if POSITIONS_FILE.exists():
-        try:
-            return json.loads(POSITIONS_FILE.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def _load_seen() -> dict:
-    if SEEN_FILE.exists():
-        try:
-            return json.loads(SEEN_FILE.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def _load_opportunities() -> list:
-    if OPPORTUNITIES_FILE.exists():
-        try:
-            return json.loads(OPPORTUNITIES_FILE.read_text())
-        except Exception:
-            pass
-    return []
+def _get_db():
+    try:
+        from database.db import get_db, init_db
+        init_db()
+        return get_db()
+    except Exception:
+        return None
 
 
 def _calc_pnl(pos: dict) -> dict:
@@ -90,18 +67,18 @@ def _calc_pnl(pos: dict) -> dict:
     action  = pos.get("action", "YES")
 
     if action == "YES":
-        pnl_usd   = (current - entry) * shares
-        pct       = (current - entry) / entry if entry > 0 else 0
+        pnl_usd = (current - entry) * shares
+        pct     = (current - entry) / entry if entry > 0 else 0
     else:
         entry_no   = 1 - entry
         current_no = 1 - current
-        pnl_usd    = (entry_no - current_no) * shares
-        pct        = (entry_no - current_no) / entry_no if entry_no > 0 else 0
+        pnl_usd = (entry_no - current_no) * shares
+        pct     = (entry_no - current_no) / entry_no if entry_no > 0 else 0
 
     return {"pnl_usd": round(pnl_usd, 2), "pct": round(pct * 100, 1)}
 
 
-# ── Rutas ────────────────────────────────────────────────────────────
+# ── Rutas ─────────────────────────────────────────────────────────────
 
 @app.route("/")
 @require_auth
@@ -112,80 +89,186 @@ def index():
 @app.route("/api/positions")
 @require_auth
 def api_positions():
-    positions = _load_positions()
+    db = _get_db()
     result = []
     total_invested = total_pnl = 0
 
-    for cid, pos in positions.items():
+    if db:
+        rows = db.execute(
+            "SELECT * FROM positions WHERE status='open' ORDER BY created_at DESC"
+        ).fetchall()
+        positions = [dict(r) for r in rows]
+    else:
+        positions = []
+
+    for pos in positions:
         pnl = _calc_pnl(pos)
-        entry_dt = pos.get("entry_date", "")
         try:
             days_ago = (datetime.now(timezone.utc) -
-                        datetime.fromisoformat(entry_dt)).days
+                        datetime.fromisoformat(pos.get("created_at", ""))).days
         except Exception:
             days_ago = 0
 
         result.append({
-            "id":       cid[:20] + "...",
-            "full_id":  cid,
+            "id":       pos["condition_id"][:20] + "...",
+            "full_id":  pos["condition_id"],
             "question": pos.get("question", "?")[:80],
             "action":   pos.get("action", "YES"),
             "entry":    round(pos.get("entry_price", 0) * 100, 1),
-            "current":  round(pos.get("current_price", 0) * 100, 1),
+            "current":  round(pos.get("current_price", pos.get("entry_price", 0)) * 100, 1),
             "amount":   pos.get("amount_usd", 0),
             "pnl_usd":  pnl["pnl_usd"],
             "pct":      pnl["pct"],
             "days_ago": days_ago,
+            "category": pos.get("category", "—"),
         })
         total_invested += pos.get("amount_usd", 0)
         total_pnl      += pnl["pnl_usd"]
 
     return jsonify({
-        "positions":       result,
-        "total_invested":  round(total_invested, 2),
-        "total_pnl":       round(total_pnl, 2),
-        "total_pnl_pct":   round(total_pnl / total_invested * 100, 1) if total_invested > 0 else 0,
+        "positions":     result,
+        "total_invested": round(total_invested, 2),
+        "total_pnl":     round(total_pnl, 2),
+        "total_pnl_pct": round(total_pnl / total_invested * 100, 1) if total_invested > 0 else 0,
     })
 
 
 @app.route("/api/opportunities")
 @require_auth
 def api_opportunities():
-    opps = _load_opportunities()
-    seen = _load_seen()
+    # Intenta de SQLite primero, fallback a JSON
+    db   = _get_db()
+    opps = []
+    if db:
+        rows = db.execute("""
+            SELECT * FROM opportunities
+            ORDER BY detected_at DESC LIMIT 30
+        """).fetchall()
+        opps = [dict(r) for r in rows]
+    else:
+        if OPPORTUNITIES_FILE.exists():
+            try:
+                opps = json.loads(OPPORTUNITIES_FILE.read_text())
+            except Exception:
+                pass
+
+    # Normaliza campos para compatibilidad con el frontend
+    normalized = []
+    for o in opps[:20]:
+        normalized.append({
+            "question":     o.get("question", ""),
+            "market_price": o.get("market_price", 0),
+            "probability":  o.get("estimated_prob") or o.get("probability", 0),
+            "edge":         o.get("edge", 0),
+            "confidence":   o.get("confidence", 0),
+            "action":       o.get("action", ""),
+            "closes_in":    o.get("closes_in") or o.get("closes_at", "—"),
+            "condition_id": o.get("condition_id", ""),
+            "category":     o.get("category", "default"),
+            "ml_prob":      o.get("ml_prob"),
+            "score":        o.get("score"),
+        })
+
     return jsonify({
-        "opportunities":  opps[:20],
-        "total_tracked":  len(seen),
-        "last_scan":      _state["last_scan"],
-        "scan_count":     _state["scan_count"],
+        "opportunities": normalized,
+        "last_scan":     _state["last_scan"],
+        "scan_count":    _state["scan_count"],
     })
 
 
 @app.route("/api/stats")
 @require_auth
 def api_stats():
-    positions = _load_positions()
-    seen      = _load_seen()
-    pnl_total = sum(_calc_pnl(p)["pnl_usd"] for p in positions.values())
-    wins      = sum(1 for p in positions.values() if _calc_pnl(p)["pnl_usd"] > 0)
+    db = _get_db()
+
+    if db:
+        try:
+            from database.db import db_get_portfolio_summary
+            summary = db_get_portfolio_summary()
+            return jsonify({
+                **summary,
+                "is_scanning": _state["is_scanning"],
+                "last_scan":   _state["last_scan"] or summary.get("last_scan"),
+            })
+        except Exception:
+            pass
+
+    # Fallback sin DB
+    return jsonify({
+        "positions_open":   0,
+        "total_pnl":        0,
+        "total_pnl_pct":    0,
+        "total_invested":   0,
+        "win_rate":         0,
+        "markets_tracked":  0,
+        "scan_count":       _state["scan_count"],
+        "last_scan":        _state["last_scan"],
+        "is_scanning":      _state["is_scanning"],
+    })
+
+
+@app.route("/api/history")
+@require_auth
+def api_history():
+    """Historial de oportunidades detectadas (últimas 7 días)."""
+    db = _get_db()
+    if not db:
+        return jsonify({"history": [], "total": 0})
+
+    rows = db.execute("""
+        SELECT category,
+               COUNT(*)          AS n,
+               AVG(ABS(edge))    AS avg_edge,
+               MAX(ABS(edge))    AS max_edge,
+               AVG(confidence)   AS avg_conf,
+               MAX(detected_at)  AS last_seen
+        FROM opportunities
+        WHERE detected_at >= datetime('now', '-7 days')
+        GROUP BY category
+        ORDER BY n DESC
+    """).fetchall()
+
+    recent = db.execute("""
+        SELECT question, category, edge, confidence, market_price, detected_at
+        FROM opportunities
+        ORDER BY detected_at DESC LIMIT 50
+    """).fetchall()
 
     return jsonify({
-        "positions_open": len(positions),
-        "markets_tracked": len(seen),
-        "total_pnl":      round(pnl_total, 2),
-        "win_rate":       round(wins / len(positions) * 100) if positions else 0,
-        "scan_count":     _state["scan_count"],
-        "last_scan":      _state["last_scan"],
-        "is_scanning":    _state["is_scanning"],
-        "uptime":         _state.get("uptime", "—"),
+        "by_category": [dict(r) for r in rows],
+        "recent":      [dict(r) for r in recent],
     })
+
+
+@app.route("/api/scan_history")
+@require_auth
+def api_scan_history():
+    """Historial de los últimos 20 escaneos."""
+    db = _get_db()
+    if not db:
+        return jsonify({"scans": []})
+
+    rows = db.execute("""
+        SELECT * FROM scan_history ORDER BY scanned_at DESC LIMIT 20
+    """).fetchall()
+    return jsonify({"scans": [dict(r) for r in rows]})
+
+
+@app.route("/api/backtest")
+@require_auth
+def api_backtest():
+    """Resultados del último backtest."""
+    if BACKTEST_FILE.exists():
+        try:
+            return jsonify(json.loads(BACKTEST_FILE.read_text()))
+        except Exception:
+            pass
+    return jsonify({"error": "Sin resultados. Usa /backtest en Telegram."})
 
 
 @app.route("/api/scan", methods=["POST"])
 @require_auth
 def api_scan():
-    """Fuerza un escaneo inmediato (no bloquea — responde inmediatamente)."""
-    # Escribe un flag que el monitor principal detecta
     Path("force_scan.flag").write_text("1")
     return jsonify({"ok": True, "message": "Escaneo forzado. Resultados en ~30s."})
 
@@ -203,7 +286,6 @@ def api_remove_position():
 
 
 def run_dashboard(host="0.0.0.0", port=8080):
-    """Inicia el dashboard en un thread separado."""
     _state["uptime"] = datetime.now(timezone.utc).isoformat()
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
