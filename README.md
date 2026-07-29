@@ -24,6 +24,13 @@ Junto al ejecutable se crean sus archivos de trabajo: `golem_config.json` (tus
 ajustes), `golem_log.txt` (registro), `golem_plantilla.png` (la imagen de
 referencia) y `golem_debug.png` (la última prueba de detección).
 
+**Ponlo en una carpeta de verdad antes de abrirlo.** Si lo ejecutas pinchando
+directamente en la descarga del navegador, Windows lo lanza desde una carpeta
+temporal que luego borra, y con ella se irían tus ajustes y la zona marcada en
+cada arranque. Golem detecta ese caso, te avisa en el registro y guarda sus
+archivos en `%LOCALAPPDATA%\Golem` para que no se pierdan — pero lo cómodo es
+copiar el `.exe` al Escritorio y abrirlo desde ahí.
+
 ## Atajos de teclado globales
 
 | Tecla | Acción |

@@ -26,6 +26,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -60,7 +61,56 @@ from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, KeyCode, Controller as KeyboardController
 
 APP_NAME = "Golem"
-APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+EXE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def _es_temporal(d):
+    """¿Está esa carpeta dentro del %TEMP% de Windows?"""
+    try:
+        t = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+        d = os.path.normcase(os.path.abspath(d))
+        return d == t or d.startswith(t + os.sep)
+    except Exception:
+        return False
+
+
+def _se_puede_escribir(d):
+    try:
+        p = os.path.join(d, ".golem_prueba_escritura")
+        with open(p, "w") as f:
+            f.write("x")
+        os.remove(p)
+        return True
+    except Exception:
+        return False
+
+
+def _elegir_dir_datos():
+    """Dónde guardar ajustes, registro, plantilla y capturas.
+
+    Junto al ejecutable mientras se pueda, que es lo cómodo y lo portable. Pero
+    si el exe se abre directamente desde la descarga del navegador, Windows lo
+    ejecuta desde un 'scoped_dir' de %TEMP% que se borra solo: los ajustes, la
+    zona marcada y la plantilla se perderían en cada arranque sin que se note.
+    En ese caso se usa %LOCALAPPDATA%\\Golem, que no se va.
+    """
+    if _es_temporal(EXE_DIR):
+        motivo = ("el ejecutable se está ejecutando desde una carpeta temporal "
+                  "de Windows, que se borra sola")
+    elif not _se_puede_escribir(EXE_DIR):
+        motivo = "no puedo escribir en la carpeta del ejecutable"
+    else:
+        return EXE_DIR, ""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    destino = os.path.join(base, APP_NAME)
+    try:
+        os.makedirs(destino, exist_ok=True)
+    except Exception:
+        return EXE_DIR, ""
+    return destino, motivo
+
+
+APP_DIR, DATA_MOTIVO = _elegir_dir_datos()
 CONFIG_PATH = os.path.join(APP_DIR, "golem_config.json")
 DEBUG_IMG = os.path.join(APP_DIR, "golem_debug.png")
 SHOT_PATH = os.path.join(APP_DIR, "golem_clic_%d.png")
@@ -1243,6 +1293,12 @@ class App:
         self.log(f"{APP_NAME} listo. F6 grabar | F7 reproducir | "
                  f"F2 marcar zona | F8 cuentagotas | F4 plantilla | "
                  f"F9 vigilar | F10 guion | F12 PARAR")
+        if DATA_MOTIVO:
+            self.log(f"AVISO: {DATA_MOTIVO}, así que guardo tus ajustes en "
+                     f"{APP_DIR}. Si quieres tenerlo todo junto al programa, "
+                     f"copia Golem.exe a una carpeta de verdad (por ejemplo en "
+                     f"el Escritorio) y ábrelo desde ahí.")
+            beep(False)
         if self._migrado:
             self.log("He cambiado tus ajustes al modo nuevo 'lo único con "
                      "color': dentro de la zona que marques clica lo único que "
@@ -1955,8 +2011,16 @@ class App:
 
     def test_detection(self):
         self._apply_settings()
-        self.log("Probando en 3 segundos — deja la pantalla como cuando "
-                 "sale el aviso…")
+        nombres = {"unico": "lo único con color", "color": "un color concreto",
+                   "plantilla": "imagen de referencia"}
+        self.log(f"Probando en 3 segundos (modo: "
+                 f"{nombres.get(self.finder.mode, self.finder.mode)}) — deja la "
+                 f"pantalla como cuando sale el aviso…")
+        if self.finder.mode == "plantilla":
+            self.log("   Ojo: con un objeto encantado este modo no es fiable, "
+                     "porque el brillo cambia el sprite en cada instante. Si el "
+                     "parecido te baila entre pruebas, es eso: usa 'lo único "
+                     "con color'.")
 
         def _do():
             time.sleep(3)
