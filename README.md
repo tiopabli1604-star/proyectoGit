@@ -93,6 +93,27 @@ También puedes dejar una macro **repitiéndose sola cada N minutos** sin tenerl
 en bucle continuo: marca "Repetir la macro sola cada …". Si en ese momento ya se
 estaba grabando o reproduciendo algo, se salta el turno en vez de pisarlo.
 
+### Escribir un texto cada N minutos
+
+Marca "Escribir un texto solo cada …", pon el texto y listo. Sirve para lo que
+hay que mandar cada cierto tiempo por el chat: un comando, un aviso, lo que sea.
+
+- **Abrir el chat con** — la tecla que abre el chat antes de escribir (en
+  Minecraft, la `t`). Déjalo vacío si no hace falta abrir nada.
+- **Intro al final** — envía el mensaje al terminar.
+- **Probarlo ahora** — lo escribe una vez, para ver que sale bien sin esperar.
+
+Dos detalles que importan. Se teclea **carácter a carácter** y con una pausa
+después de abrir el chat: volcando la cadena de golpe, un juego a 60 fps se salta
+letras.
+
+Y sobre todo: **nunca escribe encima de una macro o un guion en marcha**. Si al
+tocarle el turno hay algo moviendo el ratón, espera a que acabe y escribe
+entonces — no se salta el turno, porque si la macro dura casi todo el intervalo
+eso significaría no escribir nunca. Así que no hace falta que las cuentas cuadren
+al minuto: si tu grabación dura 30 minutos y pones el texto cada 31, cuadra; y si
+un día se desfasa, el texto simplemente espera el hueco.
+
 ## Vigilante (clic automático)
 
 Escanea la pantalla cada X segundos buscando el objetivo y hace clic en su

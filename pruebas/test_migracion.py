@@ -121,7 +121,7 @@ def p_config_roto():
     app = G.App(root)
     try:
         check("arranca en unico", app.finder.mode == "unico", app.finder.mode)
-        root.update()      # log() pinta con root.after, hay que dejarlo correr
+        app._drain_log(reprogramar=False)   # log() encola; hay que volcar
         texto = app.txt_log.get("1.0", "end")
         check("lo dice en el registro", "No pude leer" in texto,
               str([l for l in texto.splitlines() if "No pude" in l][:1]))

@@ -25,6 +25,7 @@ import ctypes
 import json
 import math
 import os
+import queue
 import sys
 import tempfile
 from ctypes import wintypes
@@ -1160,6 +1161,34 @@ def resolver_tecla(nombre):
         raise ValueError(f"no conozco la tecla '{nombre}'")
 
 
+def type_text(kb, texto, tecla_antes=None, intro=True, delay_char=0.02,
+              delay_ui=0.30):
+    """Teclea un texto como lo haría una persona, no de un volcado.
+
+    Dos pausas que hacen falta en un juego:
+
+      · tras abrir el chat con una tecla (la T en Minecraft) hay que darle un
+        momento a que aparezca; si se empieza a teclear en el mismo fotograma,
+        las primeras letras se pierden;
+      · carácter a carácter, porque volcando la cadena de golpe un juego a 60
+        fps se salta letras.
+    """
+    if tecla_antes:
+        k = resolver_tecla(tecla_antes)
+        kb.press(k)
+        time.sleep(0.05)
+        kb.release(k)
+        time.sleep(delay_ui)
+    for ch in texto:
+        kb.type(ch)
+        time.sleep(delay_char)
+    if intro:
+        time.sleep(0.15)
+        kb.press(keyboard.Key.enter)
+        time.sleep(0.05)
+        kb.release(keyboard.Key.enter)
+
+
 class Script:
     """Guion de varios pasos: busca, clica, espera, salta, repite.
 
@@ -1534,7 +1563,9 @@ class Script:
                     i += 1
 
                 elif op == "escribir":
-                    self.keyboard.type(paso["texto"])
+                    # con la misma cadencia que el texto programado: de golpe,
+                    # un juego se salta letras
+                    type_text(self.keyboard, paso["texto"], intro=False)
                     self.log(f"{n}. escrito «{paso['texto']}»")
                     i += 1
 
@@ -1594,11 +1625,23 @@ class App:
         self._zone_p1 = None
         self._sched_stop = threading.Event()
         self._sched_thread = None
+        self._kb = KeyboardController()
+        self._txt_stop = threading.Event()
+        self._txt_thread = None
+        self._txt_count = 0
+        # copias normales de ajustes que leen otros hilos, porque las variables
+        # de Tkinter solo se pueden tocar desde el hilo de la interfaz
+        self._logfile_on = True
+        self._txt_payload = ("", None, True)
+        self._log_queue = queue.Queue()
+        self._status_pend = None
+        self._cerrando = False
 
         self._build_ui()
         self._migrado = False
         self._load_config()
         self._start_hotkeys()
+        self._drain_log()          # arranca el vaciado periódico de la cola
         self.log(f"{APP_NAME} listo. F6 grabar | F7 reproducir | "
                  f"F2 marcar zona | F8 cuentagotas | F4 plantilla | "
                  f"F9 vigilar | F10 guion | F12 PARAR")
@@ -1670,6 +1713,38 @@ class App:
                              "Minecraft, FPS…)",
                         variable=self.var_relative,
                         command=self._on_relative_change).pack(side="left")
+
+        row5 = ttk.Frame(fm)
+        row5.pack(fill="x", **pad)
+        self.var_txt_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row5, text="Escribir un texto solo cada",
+                        variable=self.var_txt_on,
+                        command=self._toggle_text_scheduler).pack(side="left")
+        self.var_txt_min = tk.StringVar(value="31")
+        ttk.Spinbox(row5, textvariable=self.var_txt_min, from_=1, to=1440,
+                    width=6).pack(side="left", padx=4)
+        ttk.Label(row5, text="minutos").pack(side="left")
+        ttk.Button(row5, text="Probarlo ahora",
+                   command=self.send_text_now).pack(side="left", padx=8)
+
+        row6 = ttk.Frame(fm)
+        row6.pack(fill="x", **pad)
+        ttk.Label(row6, text="Texto:").pack(side="left")
+        self.var_txt_text = tk.StringVar(value="")
+        ttk.Entry(row6, textvariable=self.var_txt_text, width=26).pack(
+            side="left", padx=4)
+        ttk.Label(row6, text="Abrir el chat con:").pack(side="left", padx=(8, 0))
+        self.var_txt_key = tk.StringVar(value="t")
+        ttk.Entry(row6, textvariable=self.var_txt_key, width=5).pack(
+            side="left", padx=4)
+        self.var_txt_enter = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row6, text="Intro al final",
+                        variable=self.var_txt_enter,
+                        command=self._apply_text_payload).pack(side="left",
+                                                               padx=6)
+        for v in (self.var_txt_text, self.var_txt_key):
+            v.trace_add("write", self._apply_text_payload)
+        self._apply_text_payload()
 
         self.lbl_macro = ttk.Label(fm, text="Sin macro cargada")
         self.lbl_macro.pack(anchor="w", **pad)
@@ -1797,7 +1872,8 @@ class App:
                         command=self._apply_topmost).pack(side="left")
         self.var_logfile = tk.BooleanVar(value=True)
         ttk.Checkbutton(fo, text="Guardar registro en archivo",
-                        variable=self.var_logfile).pack(side="left", padx=10)
+                        variable=self.var_logfile,
+                        command=self._apply_logfile).pack(side="left", padx=10)
         ttk.Button(fo, text="■ PARADA TOTAL (F12)",
                    command=self.panic).pack(side="right", padx=4)
 
@@ -1851,32 +1927,59 @@ class App:
 
     # ---------- helpers ----------
     def log(self, msg):
-        linea = time.strftime("[%H:%M:%S] ") + msg
+        """Apunta una línea. Se puede llamar desde cualquier hilo.
 
-        def _append():
-            self.txt_log.configure(state="normal")
-            self.txt_log.insert("end", linea + "\n")
-            self.txt_log.see("end")
-            self.txt_log.configure(state="disabled")
-        # Los hilos del vigilante y del guion registran cosas, y pueden hacerlo
-        # justo mientras se cierra la ventana: entonces el root ya no existe y
-        # after() lanzaría TclError dentro de ese hilo.
-        try:
-            self.root.after(0, _append)
-        except Exception:
-            pass
-        if getattr(self, "var_logfile", None) and self.var_logfile.get():
+        Tkinter no es seguro entre hilos, y aquí escriben el vigilante, el
+        guion y el temporizador del texto. Así que ningún hilo toca la
+        interfaz: dejan la línea en una cola y el hilo de la ventana la vacía.
+        Antes se llamaba a root.after() desde el hilo, que a veces funciona y a
+        veces suelta un 'invalid command name' o revienta al cerrar.
+        """
+        linea = time.strftime("[%H:%M:%S] ") + msg
+        self._log_queue.put(linea)
+        # el archivo es Python normal, se puede escribir desde cualquier hilo;
+        # y _logfile_on es una copia de la casilla, no la variable de Tkinter
+        if self._logfile_on:
             try:
                 with open(LOG_PATH, "a", encoding="utf-8") as f:
                     f.write(time.strftime("%Y-%m-%d ") + linea + "\n")
             except Exception:
                 pass
 
-    def set_status(self, text):
+    def _drain_log(self, reprogramar=True):
+        """Vuelca la cola en la ventana. Solo lo llama el hilo de la interfaz."""
+        lineas = []
         try:
-            self.root.after(0, lambda: self.status.configure(text=text))
-        except Exception:
+            while True:
+                lineas.append(self._log_queue.get_nowait())
+        except queue.Empty:
             pass
+        if lineas:
+            try:
+                self.txt_log.configure(state="normal")
+                self.txt_log.insert("end", "\n".join(lineas) + "\n")
+                self.txt_log.see("end")
+                self.txt_log.configure(state="disabled")
+            except Exception:
+                pass
+        if self._status_pend is not None:
+            try:
+                self.status.configure(text=self._status_pend)
+            except Exception:
+                pass
+            self._status_pend = None
+        if reprogramar and not self._cerrando:
+            try:
+                self.root.after(120, self._drain_log)
+            except Exception:
+                pass
+
+    def _apply_logfile(self):
+        self._logfile_on = bool(self.var_logfile.get())
+
+    def set_status(self, text):
+        # igual que log(): se deja escrito y lo aplica el hilo de la ventana
+        self._status_pend = text
 
     def _apply_topmost(self):
         self.root.attributes("-topmost", self.var_topmost.get())
@@ -1932,6 +2035,10 @@ class App:
             self.var_sched.set(False)
             self._toggle_scheduler()
             paro.append("repetición programada")
+        if self.var_txt_on.get():
+            self.var_txt_on.set(False)
+            self._toggle_text_scheduler()
+            paro.append("texto programado")
         self.set_status("PARADA TOTAL")
         self.log("PARADA TOTAL: " + (", ".join(paro) if paro
                                      else "no había nada activo") + ".")
@@ -2298,6 +2405,106 @@ class App:
             self.log("Repetición programada: lanzando la macro.")
             self.root.after(0, self.toggle_play)
 
+    # ---------- texto programado ----------
+    def _ocupado(self):
+        """¿Hay algo moviendo el ratón o el teclado ahora mismo?"""
+        return (self.recorder.recording or self.player.playing
+                or self.script.running)
+
+    def _toggle_text_scheduler(self):
+        if not self.var_txt_on.get():
+            self._txt_stop.set()
+            self.log("Texto programado desactivado.")
+            return
+        texto = self.var_txt_text.get()
+        if not texto.strip():
+            self.log("Escribe primero el texto que quieres que ponga.")
+            self.var_txt_on.set(False)
+            return
+        try:
+            minutos = float(self.var_txt_min.get().replace(",", "."))
+            if minutos <= 0:
+                raise ValueError
+        except ValueError:
+            self.log("Los minutos del texto no son un número válido.")
+            self.var_txt_on.set(False)
+            return
+        tecla = self.var_txt_key.get().strip()
+        if tecla:
+            try:
+                resolver_tecla(tecla)
+            except ValueError as exc:
+                self.log(f"La tecla para abrir el chat no vale: {exc}.")
+                self.var_txt_on.set(False)
+                return
+        self._txt_stop.clear()
+        self._txt_thread = threading.Thread(
+            target=self._txt_run, args=(minutos,), daemon=True)
+        self._txt_thread.start()
+        self.log(f"Texto programado: «{texto}» cada {minutos:g} minutos"
+                 + (f", abriendo el chat con '{tecla}'" if tecla else "")
+                 + (" y pulsando Intro." if self.var_txt_enter.get() else "."))
+        self.log("   Si al tocarle el turno hay una macro o un guion en marcha, "
+                 "espera a que acabe antes de escribir, para no pisar el "
+                 "movimiento. No hace falta que las cuentas cuadren al minuto.")
+
+    def _txt_run(self, minutos):
+        periodo = minutos * 60
+        while not self._txt_stop.wait(periodo):
+            # Esperar un hueco en vez de saltárselo: si la macro dura casi todo
+            # el periodo, saltárselo significaría no escribir nunca. Se espera
+            # como mucho un periodo entero, para no acumular turnos.
+            t0 = time.perf_counter()
+            aviso = False
+            while self._ocupado():
+                if not aviso:
+                    self.log("Texto programado: hay algo en marcha, espero un "
+                             "hueco para no pisar el movimiento.")
+                    aviso = True
+                if time.perf_counter() - t0 > periodo:
+                    self.log("Texto programado: he esperado un periodo entero "
+                             "y sigue ocupado; me salto este turno.")
+                    break
+                if self._txt_stop.wait(1.0):
+                    return
+            else:
+                self._enviar_texto(programado=True)
+
+    def _apply_text_payload(self, *_):
+        """Copia lo que hay que escribir a atributos normales.
+
+        El hilo del temporizador no puede leer variables de Tkinter (solo se
+        pueden tocar desde el hilo de la interfaz), así que trabaja con esta
+        copia. El trace la actualiza en cuanto cambias la casilla, de modo que
+        editar el texto con el temporizador en marcha surte efecto igual.
+        """
+        self._txt_payload = (self.var_txt_text.get(),
+                             self.var_txt_key.get().strip() or None,
+                             bool(self.var_txt_enter.get()))
+
+    def _enviar_texto(self, programado=False):
+        texto, tecla, intro = self._txt_payload
+        if not texto:
+            self.log("No hay texto que escribir.")
+            return False
+        try:
+            type_text(self._kb, texto, tecla_antes=tecla, intro=intro)
+        except Exception as exc:
+            self.log(f"No pude escribir el texto: {exc}")
+            beep(False)
+            return False
+        self._txt_count += 1
+        self.log(("Texto programado escrito" if programado else "Texto escrito")
+                 + f": «{texto}»  [total: {self._txt_count}]")
+        return True
+
+    def send_text_now(self):
+        if self._ocupado():
+            self.log("Ahora mismo hay una macro o un guion en marcha; para eso "
+                     "primero y vuelve a probar.")
+            return
+        threading.Thread(target=self._enviar_texto, daemon=True).start()
+
     def save_macro(self):
         if not self.events:
             self.log("Nada que guardar.")
@@ -2486,6 +2693,8 @@ class App:
             "interval": self.var_interval, "cooldown": self.var_cooldown,
             "repeats": self.var_repeats, "speed": self.var_speed,
             "sched_min": self.var_sched_min,
+            "txt_min": self.var_txt_min, "txt_text": self.var_txt_text,
+            "txt_key": self.var_txt_key,
         }
 
     def _load_config(self):
@@ -2518,8 +2727,11 @@ class App:
         self.var_shots.set(cfg.get("shots", True))
         self.var_topmost.set(cfg.get("topmost", False))
         self.var_logfile.set(cfg.get("logfile", True))
+        self._apply_logfile()
         self.var_relative.set(cfg.get("relative", False))
         self.recorder.relative = self.var_relative.get()
+        self.var_txt_enter.set(cfg.get("txt_enter", True))
+        self._apply_text_payload()
         guardados = cfg.get("targets")
         if isinstance(guardados, dict):
             self.targets.clear()          # el Script comparte este mismo dict
@@ -2544,6 +2756,7 @@ class App:
         cfg["targets"] = self.targets
         cfg["script"] = self.txt_script.get("1.0", "end").rstrip()
         cfg["relative"] = self.var_relative.get()
+        cfg["txt_enter"] = self.var_txt_enter.get()
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
@@ -2551,8 +2764,10 @@ class App:
             pass
 
     def _on_close(self):
+        self._cerrando = True
         self._save_config()
         self._sched_stop.set()
+        self._txt_stop.set()
         self.script.stop()
         self.player.stop()
         self.watcher.stop()

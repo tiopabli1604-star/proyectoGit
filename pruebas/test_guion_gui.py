@@ -46,7 +46,16 @@ def cerrar(app, root):
 
 
 def registro(app, root):
-    root.update()
+    """El registro tal como lo vera la ventana.
+
+    log() deja las lineas en una cola y las vuelca el hilo de la interfaz cada
+    120 ms, asi que aqui hay que forzar el volcado: un root.update() a secas no
+    ejecuta un after() que todavia no le toca.
+    """
+    try:
+        app._drain_log(reprogramar=False)
+    except Exception:
+        pass
     return app.txt_log.get("1.0", "end")
 
 
