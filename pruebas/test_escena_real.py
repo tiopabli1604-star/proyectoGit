@@ -96,8 +96,9 @@ def instalar(escenas):
 
 
 def calibrado():
-    """Como queda tras pulsar F8 sobre el cristal."""
+    """Como queda tras pulsar F8 sobre el cristal (modo de tono concreto)."""
     f = G.Finder()
+    f.mode = "color"
     h, s, v = HSV_CRISTAL
     f.hue, f.hue_tol = h, 12
     f.sat_min, f.val_min = max(25, s - 60), max(50, v - 60)

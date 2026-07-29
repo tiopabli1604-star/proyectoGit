@@ -6,14 +6,15 @@ Un gólem al que le enseñas una tarea y la repite por ti:
 
   · Grabador de macros: captura todos los eventos de ratón (movimiento, clic,
     arrastre, rueda) y teclado con sus tiempos exactos, y los reproduce igual.
-  · Vigilante de pantalla: detecta un color o una imagen de referencia y hace
-    clic en su centro automáticamente, esté donde esté.
+  · Vigilante de pantalla: encuentra el objetivo y hace clic en su centro
+    automáticamente, esté donde esté. Por defecto busca "lo único con color"
+    dentro de la zona que marques, que no necesita calibración alguna.
 
 Hotkeys globales:
   F6  = grabar / parar grabación
   F7  = reproducir / parar reproducción
-  F8  = cuentagotas: capturar el color bajo el ratón y calibrarse solo
   F2  = marcar la zona de búsqueda: dos esquinas, una pulsación cada una
+  F8  = cuentagotas: capturar el color bajo el ratón y calibrarse solo
   F4  = capturar plantilla: recorta la imagen bajo el ratón como referencia
   F9  = activar / desactivar el vigilante
   F12 = PARADA TOTAL de emergencia
@@ -285,18 +286,22 @@ class Player:
 # ---------------------------------------------------------------- detector
 
 class Finder:
-    """Localiza el objetivo en pantalla, por color o por imagen de referencia.
+    """Localiza el objetivo en pantalla.
 
-    Modo 'color': máscara HSV + componentes conexas. Rápido y tolerante a que
-    el objetivo cambie de tamaño, pero puede confundirse con otros objetos del
-    mismo tono.
+    Modo 'unico': lo único que tenga color. No mira el tono, solo si el píxel
+    está saturado, así que dentro de un cofre — donde las casillas vacías son
+    gris puro — el objeto es lo único que puede salir. No hay nada que
+    calibrar, y el brillo morado de un encantamiento deja de estorbar porque
+    también es color y se suma a la mancha en vez de romperla.
+    Modo 'color': máscara HSV de un tono concreto. Útil cuando dentro de la
+    zona hay varias cosas con color y solo interesa una.
     Modo 'plantilla': cv2.matchTemplate contra un recorte capturado por el
     usuario. Mucho más selectivo, pero exige que el objetivo se vea igual
-    (mismo tamaño y resolución).
+    (mismo tamaño y resolución) — inservible con objetos encantados.
     """
 
     def __init__(self):
-        self.mode = "color"
+        self.mode = "unico"
         # --- color ---
         self.hue = 48        # verde lima; el cuentagotas (F8) lo afina
         self.hue_tol = 12
@@ -346,6 +351,14 @@ class Finder:
     # ---- modo color ----
     def build_mask(self, bgr_small):
         hsv = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2HSV)
+        if self.mode == "unico":
+            # cualquier píxel con color, sin mirar el tono: el gris de las
+            # casillas vacías tiene saturación casi 0 y se queda fuera solo
+            mask = cv2.inRange(hsv,
+                               np.array([0, self.sat_min, self.val_min]),
+                               np.array([179, 255, 255]))
+            return cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                    np.ones((2, 2), np.uint8))
         lo_h = self.hue - self.hue_tol
         hi_h = self.hue + self.hue_tol
         if lo_h < 0 or hi_h > 179:
@@ -532,6 +545,43 @@ class Finder:
                                              save_debug)
         return self._color_candidates(save_debug)
 
+    def zone_report(self):
+        """Qué hay dentro de la zona de búsqueda, en HSV.
+
+        Cuando no detecta nada, esto dice si el problema es la zona (el fondo
+        sale coloreado => está sobre el paisaje) o el umbral (el fondo es gris
+        y el objetivo está ahí, pero no pasa el filtro).
+        """
+        bgr, mon = self.grab_screen()
+        band, x_ini, y_ini = self._band(bgr)
+        hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        alto, ancho = band.shape[:2]
+        out = [f"zona mirada: {ancho}x{alto} px desde "
+               f"({x_ini + mon['left']}, {y_ini + mon['top']})",
+               f"fondo de la zona: tono {int(np.median(h))}, "
+               f"saturación {int(np.median(s))}, brillo {int(np.median(v))}"]
+        if int(np.median(s)) > 60:
+            out.append("   el fondo tiene bastante color: la zona no parece "
+                       "estar sobre el gris de una interfaz")
+        umbral = max(40, int(np.percentile(s, 99.5)))
+        sel = (s >= umbral) & (v >= 40)
+        n = int(sel.sum())
+        if n >= 10:
+            out.append(f"lo más coloreado que hay dentro ({n} px con "
+                       f"saturación >= {umbral}): tono {int(np.median(h[sel]))}, "
+                       f"saturación {int(np.median(s[sel]))}, "
+                       f"brillo {int(np.median(v[sel]))}")
+            out.append(f"   con los ajustes de ahora exiges saturación >= "
+                       f"{self.sat_min} y brillo >= {self.val_min}"
+                       + (f", y tono {self.hue} ± {self.hue_tol}"
+                          if self.mode == "color" else ""))
+        else:
+            out.append("dentro de la zona no hay practicamente nada con "
+                       "color: ¿está bien marcada, y estaba el aviso en "
+                       "pantalla al probar?")
+        return out
+
     def pick_color_at_cursor(self, muestras=5, gap=0.06):
         """Lee el color bajo el ratón. Devuelve (h, s, v, b, g, r, inestable).
 
@@ -708,11 +758,17 @@ class App:
         self._sched_thread = None
 
         self._build_ui()
+        self._migrado = False
         self._load_config()
         self._start_hotkeys()
         self.log(f"{APP_NAME} listo. F6 grabar | F7 reproducir | "
-                 f"F8 cuentagotas | F2 marcar zona | F4 plantilla | "
+                 f"F2 marcar zona | F8 cuentagotas | F4 plantilla | "
                  f"F9 vigilar | F12 PARAR")
+        if self._migrado:
+            self.log("He cambiado tus ajustes al modo nuevo 'lo único con "
+                     "color': dentro de la zona que marques clica lo único que "
+                     "tenga color, sin calibrar ningún tono. Vuelve a marcar la "
+                     "zona con F2 y prueba la detección.")
         if self.finder.template is not None:
             th, tw = self.finder.template.shape[:2]
             self.log(f"Plantilla cargada de disco ({tw}x{th} px).")
@@ -771,14 +827,17 @@ class App:
 
         rowm = ttk.Frame(fc)
         rowm.pack(fill="x", **pad)
-        ttk.Label(rowm, text="Buscar por:").pack(side="left")
-        self.var_mode = tk.StringVar(value="color")
-        ttk.Radiobutton(rowm, text="Color", value="color",
+        ttk.Label(rowm, text="Buscar:").pack(side="left")
+        self.var_mode = tk.StringVar(value="unico")
+        ttk.Radiobutton(rowm, text="Lo único con color", value="unico",
                         variable=self.var_mode,
-                        command=self._apply_settings).pack(side="left", padx=4)
+                        command=self._on_mode_change).pack(side="left", padx=4)
+        ttk.Radiobutton(rowm, text="Un color concreto", value="color",
+                        variable=self.var_mode,
+                        command=self._on_mode_change).pack(side="left", padx=4)
         ttk.Radiobutton(rowm, text="Imagen de referencia", value="plantilla",
                         variable=self.var_mode,
-                        command=self._apply_settings).pack(side="left", padx=4)
+                        command=self._on_mode_change).pack(side="left", padx=4)
 
         rowc0 = ttk.Frame(fc)
         rowc0.pack(fill="x", **pad)
@@ -970,6 +1029,19 @@ class App:
                                      else "no había nada activo") + ".")
         beep(False)
 
+    def _on_mode_change(self):
+        self._apply_settings()
+        if self.finder.mode == "unico":
+            self.log("Modo 'lo único con color': no hace falta el cuentagotas. "
+                     "Marca la zona con F2 y listo — dentro de ella clicará lo "
+                     "único que tenga color, sea del tono que sea.")
+        elif self.finder.mode == "color":
+            self.log("Modo 'un color concreto': usa el cuentagotas (F8) sobre "
+                     "el objetivo para calibrar el tono.")
+        else:
+            self.log("Modo 'imagen de referencia': captura el recorte con F4. "
+                     "No sirve con objetos encantados.")
+
     # ---------- zona de búsqueda ----------
     def mark_zone(self):
         """Marca el rectángulo de búsqueda con dos pulsaciones de F2.
@@ -1046,6 +1118,9 @@ class App:
                      "de un objeto encantado; he usado el color de debajo. "
                      "Deja 'Fotogramas unidos' en 3 o más y NO uses el modo "
                      "Imagen de referencia con objetos encantados.")
+        self.log("He cambiado al modo 'un color concreto'. Si dentro de tu "
+                 "zona el objetivo es lo único que tiene color, el modo 'lo "
+                 "único con color' acierta más y no necesita esta calibración.")
         self.log("Pulsa 'Probar detección' para comprobarlo sin clicar.")
         beep(True)
 
@@ -1195,7 +1270,19 @@ class App:
             self._apply_settings()
             if self.finder.mode == "plantilla" and self.finder.template is None:
                 self.log("No hay imagen de referencia: captúrala con F4 o "
-                         "cambia a modo Color.")
+                         "cambia a otro modo.")
+                return
+            f = self.finder
+            sin_zona = (f.roi_left, f.roi_right, f.roi_top,
+                        f.roi_bottom) == (0.0, 1.0, 0.0, 1.0)
+            if f.mode == "unico" and sin_zona and not f.on_gui:
+                self.log("No activo la vigilancia: en modo 'lo único con "
+                         "color', sin zona marcada y sin el filtro de "
+                         "interfaz, mira toda la pantalla — y en un juego casi "
+                         "todo tiene color, así que clicaría cualquier cosa. "
+                         "Marca la zona con F2 (o marca 'Solo sobre una "
+                         "interfaz').")
+                beep(False)
                 return
             self.watcher.start()
             self.btn_watch.configure(text="Desactivar vigilancia (F9)")
@@ -1226,8 +1313,17 @@ class App:
                              "Baja el 'Parecido mín.' o recaptura la imagen."
                              if sc is not None else "NO detectado.")
                 else:
-                    self.log("NO detectado. Prueba a bajar 'Área mín.', bajar "
-                             "'Saturación mín.' o subir la tolerancia de tono.")
+                    self.log("NO detectado. Esto es lo que veía dentro de la "
+                             "zona:")
+                    try:
+                        for l in self.finder.zone_report():
+                            self.log("   " + l)
+                    except Exception as exc:
+                        self.log(f"   (no se pudo inspeccionar la zona: {exc})")
+                    self.log("Si el fondo sale gris y el objetivo aparece "
+                             "arriba, baja 'Área mín.' o 'Saturación mín.'. "
+                             "Si el fondo sale con color, vuelve a marcar la "
+                             "zona con F2.")
             else:
                 self.log(f"{len(found)} candidato(s). El nº 1 es el que se "
                          f"clicaría:")
@@ -1238,8 +1334,8 @@ class App:
                     self.log(f"   {i}. ({x}, {y})  {det}")
                 if len(found) > 1:
                     self.log("Hay más de un candidato: si el correcto no es "
-                             "el nº 1, acota la zona de búsqueda (% alto), "
-                             "aprieta la tolerancia o usa el modo Imagen.")
+                             "el nº 1, aprieta la zona con F2 hasta que solo "
+                             "quede uno. Es lo que mejor funciona.")
             for r in self.finder.rejects[:8]:
                 self.log("   · " + r)
             self.log(f"Imagen de depuración: {DEBUG_IMG}")
@@ -1302,15 +1398,28 @@ class App:
         }
 
     def _load_config(self):
+        if not os.path.exists(CONFIG_PATH):
+            self._apply_settings()
+            return
         try:
-            with open(CONFIG_PATH, encoding="utf-8") as f:
+            # utf-8-sig: el Notepad de Windows guarda con BOM, y con "utf-8"
+            # pelado json.load reventaría y se perderían todos los ajustes
+            # sin decir nada.
+            with open(CONFIG_PATH, encoding="utf-8-sig") as f:
                 cfg = json.load(f)
-        except Exception:
+        except Exception as exc:
+            self.log(f"No pude leer {os.path.basename(CONFIG_PATH)} ({exc}); "
+                     "sigo con los ajustes de fábrica.")
             self._apply_settings()
             return
         for k, var in self._cfg_map().items():
             if k in cfg:
                 var.set(str(cfg[k]))
+        # Los ajustes guardados por una versión anterior traen mode="color",
+        # que pisaría el modo nuevo. Se cambia una sola vez y se avisa.
+        if int(cfg.get("v", 1)) < 2 and self.var_mode.get() == "color":
+            self.var_mode.set("unico")
+            self._migrado = True
         self.var_double.set(cfg.get("double", False))
         self.var_restore.set(cfg.get("restore", True))
         self.var_sound.set(cfg.get("sound", True))
@@ -1323,6 +1432,7 @@ class App:
 
     def _save_config(self):
         cfg = {k: var.get() for k, var in self._cfg_map().items()}
+        cfg["v"] = 2
         cfg["double"] = self.var_double.get()
         cfg["restore"] = self.var_restore.get()
         cfg["sound"] = self.var_sound.get()

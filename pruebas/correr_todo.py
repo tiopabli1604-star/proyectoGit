@@ -5,7 +5,8 @@ import subprocess
 import sys
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
-SUITES = ("test_base.py", "test_zona.py", "test_escena_real.py")
+SUITES = ("test_base.py", "test_zona.py", "test_escena_real.py",
+          "test_unico.py", "test_migracion.py")
 
 if __name__ == "__main__":
     fallos = []

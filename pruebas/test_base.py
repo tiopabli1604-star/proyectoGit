@@ -55,7 +55,10 @@ def cuadro(img, cx, cy, lado, hsv):
 
 
 def finder(hue=48, tol=12, **kw):
+    # estas pruebas son del modo de tono concreto, no del de "lo unico con
+    # color" (que es el de fabrica), asi que hay que fijarlo explicitamente
     f = G.Finder()
+    f.mode = "color"
     f.hue, f.hue_tol = hue, tol
     f.sat_min, f.val_min = 40, 90
     f.frames, f.frame_gap = 1, 0.0

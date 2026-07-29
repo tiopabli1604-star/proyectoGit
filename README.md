@@ -25,8 +25,8 @@ referencia) y `golem_debug.png` (la última prueba de detección).
 |-------|--------|
 | F6    | Empezar / parar grabación |
 | F7    | Reproducir / parar reproducción |
-| F8    | Cuentagotas: capturar el color bajo el ratón y calibrarse solo |
 | F2    | Marcar la zona de búsqueda (una esquina por pulsación) |
+| F8    | Cuentagotas: capturar el color bajo el ratón y calibrarse solo |
 | F4    | Capturar la imagen bajo el ratón como referencia |
 | F9    | Activar / desactivar el vigilante |
 | F12   | **Parada total de emergencia** |
@@ -106,7 +106,25 @@ clicado (`golem_clic_1.png` … `_3.png`, rotando). Es la forma de auditar un cl
 que ocurrió mientras no mirabas: el botón **Ver último clic** abre la más
 reciente.
 
-Hay dos formas de decirle qué buscar:
+Hay tres formas de decirle qué buscar:
+
+### Modo Lo único con color (el de por defecto)
+
+No mira el tono: solo si el píxel tiene color. Las casillas vacías de un cofre
+son gris puro, así que dentro de esa zona el objeto es lo único que puede salir,
+sea verde, rojo o rosa. **No hay nada que calibrar.**
+
+Es más fiable que buscar un tono concreto por tres razones:
+
+- no depende de acertar con el color, que con un cristal translúcido cambia según
+  lo que haya detrás;
+- el brillo morado de un objeto encantado también es color, así que en vez de
+  romper la mancha se le suma — el problema se convierte en ayuda;
+- funciona igual si mañana el servidor cambia el objeto por otro de otro color.
+
+A cambio exige que la zona esté bien puesta, porque en un juego casi todo tiene
+color. Si activas la vigilancia sin zona marcada y sin el filtro de interfaz, el
+programa se niega y te lo dice, en vez de ponerse a clicar el paisaje.
 
 ### Objetos encantados
 
@@ -124,9 +142,10 @@ parpadeaba.
 Con objetos encantados **no uses el modo Imagen de referencia**: la plantilla
 guardaría el brillo en una posición que no se repite nunca.
 
-### Modo Color
+### Modo Un color concreto
 
-Máscara de color HSV: rápido, y funciona aunque el objeto cambie de tamaño.
+Máscara de color HSV. Solo hace falta cuando dentro de la zona hay varias cosas
+con color y hay que quedarse con una.
 
 **1. Cuentagotas.** Deja en pantalla el objeto que hay que clicar, pon el ratón
 justo encima y pulsa **F8**. El programa lee el color de esos píxeles (mediana de
@@ -190,11 +209,15 @@ Si lo que quieres es clicar un objeto que aparece en una casilla de un menú:
 1. Deja en pantalla el aviso, con el objeto visible.
 2. Ratón en una esquina de la rejilla → **F2**; ratón en la esquina opuesta →
    **F2**. Deja fuera tu propio inventario.
-3. Ratón encima del objeto → **F8** (modo **Color**).
-4. **Probar detección (3 s)** y mira el registro: debería salir **un solo
+3. **Probar detección (3 s)** y mira el registro: debería salir **un solo
    candidato**, en las coordenadas del objeto. Si sale más de uno, aprieta la
    zona.
-5. **F9** para activar la vigilancia, y ya se queda esperando.
+4. **F9** para activar la vigilancia, y ya se queda esperando.
+
+No hay paso de calibración: el modo por defecto no la necesita. Si no detecta
+nada, el registro te dice qué veía dentro de la zona (el tono, la saturación y el
+brillo del fondo y de lo más coloreado que hubiera), que es lo que hace falta
+para saber si el problema es la zona o un umbral.
 
 Los dos módulos conviven: el vigilante se pausa solo mientras grabas o
 reproduces una macro.
