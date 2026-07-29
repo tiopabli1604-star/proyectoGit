@@ -13,6 +13,7 @@ Hotkeys globales:
   F6  = grabar / parar grabación
   F7  = reproducir / parar reproducción
   F8  = cuentagotas: capturar el color bajo el ratón y calibrarse solo
+  F2  = marcar la zona de búsqueda: dos esquinas, una pulsación cada una
   F4  = capturar plantilla: recorta la imagen bajo el ratón como referencia
   F9  = activar / desactivar el vigilante
   F12 = PARADA TOTAL de emergencia
@@ -20,6 +21,7 @@ Hotkeys globales:
 
 import ctypes
 import json
+import math
 import os
 import sys
 import threading
@@ -68,9 +70,10 @@ HOTKEY_PLAY = keyboard.Key.f7
 HOTKEY_PICK = keyboard.Key.f8
 HOTKEY_TEMPLATE = keyboard.Key.f4
 HOTKEY_WATCH = keyboard.Key.f9
+HOTKEY_ZONE = keyboard.Key.f2
 HOTKEY_PANIC = keyboard.Key.f12
 HOTKEYS = {HOTKEY_RECORD, HOTKEY_PLAY, HOTKEY_PICK, HOTKEY_TEMPLATE,
-           HOTKEY_WATCH, HOTKEY_PANIC}
+           HOTKEY_WATCH, HOTKEY_ZONE, HOTKEY_PANIC}
 
 SCALE = 0.5  # las capturas de color se analizan a media resolución
 
@@ -311,8 +314,11 @@ class Finder:
         self.tpl_thr = 0.85     # correlación mínima para aceptar
         self.last_score = 0.0
         # --- común ---
-        self.roi_top = 0.0      # fracción de pantalla donde empieza la búsqueda
-        self.roi_bottom = 1.0   # y donde acaba
+        # zona de búsqueda, en fracción de pantalla
+        self.roi_top = 0.0
+        self.roi_bottom = 1.0
+        self.roi_left = 0.0
+        self.roi_right = 1.0
         self.rejects = []       # motivos de descarte del último escaneo
         self.load_template()
 
@@ -325,13 +331,17 @@ class Finder:
         return img[:, :, :3], mon  # BGR, monitor
 
     def _band(self, bgr):
-        """Recorta la franja vertical de búsqueda. Devuelve (banda, y_ini)."""
-        h = bgr.shape[0]
+        """Recorta el rectángulo de búsqueda. Devuelve (recorte, x_ini, y_ini)."""
+        h, w = bgr.shape[:2]
         y_ini = int(h * max(0.0, min(1.0, self.roi_top)))
         y_fin = int(h * max(0.0, min(1.0, self.roi_bottom)))
+        x_ini = int(w * max(0.0, min(1.0, self.roi_left)))
+        x_fin = int(w * max(0.0, min(1.0, self.roi_right)))
         if y_fin - y_ini < 10:
             y_ini, y_fin = 0, h
-        return bgr[y_ini:y_fin, :], y_ini
+        if x_fin - x_ini < 10:
+            x_ini, x_fin = 0, w
+        return bgr[y_ini:y_fin, x_ini:x_fin], x_ini, y_ini
 
     # ---- modo color ----
     def build_mask(self, bgr_small):
@@ -354,11 +364,16 @@ class Finder:
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
     def _on_gui_panel(self, hsv, x, y, w, h):
-        """¿El objetivo está sobre el gris de una interfaz?
+        """¿El objetivo está sobre el gris claro de una interfaz?
 
-        Mira un anillo alrededor del objeto. En un cofre el fondo es gris casi
-        sin saturación; sobre el césped, las hojas o el agua es un color vivo.
-        Es lo que distingue un objeto en una casilla de un trozo de paisaje.
+        Mira un anillo alrededor del objeto y exige que sea gris (poca
+        saturación) y claro (brillo alto), como el panel de un cofre:
+
+          · sobre el césped, las hojas o el agua el fondo es un color vivo,
+            así que la saturación lo delata;
+          · el texto de colores del HUD (nombre del bioma, marcadores) está
+            sobre fondos oscuros y poco saturados, así que ahí lo que lo
+            delata es el brillo.
         """
         alto, ancho = hsv.shape[:2]
         m = max(4, int(min(w, h) * 0.9))
@@ -371,7 +386,9 @@ class Finder:
         anillo[y - y0:y + h - y0, x - x0:x + w - x0] = False  # fuera el objeto
         if not anillo.any():
             return True
-        return float(np.median(zona[:, :, 1][anillo])) < 60
+        sat = float(np.median(zona[:, :, 1][anillo]))
+        val = float(np.median(zona[:, :, 2][anillo]))
+        return sat < 60 and val > 110
 
     def _color_candidates(self, save_debug=False):
         """Máscara de color sobre la unión de varios fotogramas.
@@ -383,12 +400,12 @@ class Finder:
         vuelve a pegar los trozos en una sola mancha.
         """
         mask = None
-        small = mon = y_ini = None
+        small = mon = x_ini = y_ini = None
         for i in range(max(1, int(self.frames))):
             if i:
                 time.sleep(max(0.0, self.frame_gap))
             bgr, mon = self.grab_screen()
-            band, y_ini = self._band(bgr)
+            band, x_ini, y_ini = self._band(bgr)
             small = cv2.resize(band, None, fx=SCALE, fy=SCALE,
                                interpolation=cv2.INTER_AREA)
             m = self.build_mask(small)
@@ -408,7 +425,7 @@ class Finder:
             area_real = int(stats[i, cv2.CC_STAT_AREA] * px_factor)
             lado_real = int(max(w, hh) / SCALE)
             cx, cy = centroids[i]
-            px = int(cx / SCALE) + mon["left"]
+            px = int(cx / SCALE) + x_ini + mon["left"]
             py = int(cy / SCALE) + y_ini + mon["top"]
 
             if area_real < self.min_area:
@@ -470,7 +487,7 @@ class Finder:
         cv2.imwrite(TEMPLATE_IMG, self.template)
         return self.template.shape[1], self.template.shape[0]
 
-    def _template_candidates(self, bgr, mon, y_ini, save_debug):
+    def _template_candidates(self, bgr, mon, x_ini, y_ini, save_debug):
         tpl = self.template
         if tpl is None:
             raise RuntimeError("no hay plantilla capturada (usa F4)")
@@ -481,7 +498,7 @@ class Finder:
         _, best, _, loc = cv2.minMaxLoc(res)
         found = []
         if best >= self.tpl_thr:
-            found.append((loc[0] + tw // 2 + mon["left"],
+            found.append((loc[0] + tw // 2 + x_ini + mon["left"],
                           loc[1] + th // 2 + y_ini + mon["top"],
                           tw * th, float(best)))
         if save_debug:
@@ -510,8 +527,9 @@ class Finder:
         self.rejects = []
         if self.mode == "plantilla":
             bgr, mon = self.grab_screen()
-            band, y_ini = self._band(bgr)
-            return self._template_candidates(band, mon, y_ini, save_debug)
+            band, x_ini, y_ini = self._band(bgr)
+            return self._template_candidates(band, mon, x_ini, y_ini,
+                                             save_debug)
         return self._color_candidates(save_debug)
 
     def pick_color_at_cursor(self, muestras=5, gap=0.06):
@@ -685,6 +703,7 @@ class App:
         self.watcher = Watcher(self.finder, self.log, self.set_status)
         self.events = []
         self.current_file = None
+        self._zone_p1 = None
         self._sched_stop = threading.Event()
         self._sched_thread = None
 
@@ -692,7 +711,8 @@ class App:
         self._load_config()
         self._start_hotkeys()
         self.log(f"{APP_NAME} listo. F6 grabar | F7 reproducir | "
-                 f"F8 cuentagotas | F4 plantilla | F9 vigilar | F12 PARAR")
+                 f"F8 cuentagotas | F2 marcar zona | F4 plantilla | "
+                 f"F9 vigilar | F12 PARAR")
         if self.finder.template is not None:
             th, tw = self.finder.template.shape[:2]
             self.log(f"Plantilla cargada de disco ({tw}x{th} px).")
@@ -766,6 +786,10 @@ class App:
                    command=self.pick_color).pack(side="left", padx=4)
         ttk.Button(rowc0, text="Capturar imagen (F4)",
                    command=self.capture_template).pack(side="left", padx=4)
+        ttk.Button(rowc0, text="Marcar zona (F2)",
+                   command=self.mark_zone).pack(side="left", padx=4)
+        ttk.Button(rowc0, text="Toda la pantalla",
+                   command=self.reset_zone).pack(side="left", padx=4)
         self.lbl_color = ttk.Label(rowc0, text="sin calibrar")
         self.lbl_color.pack(side="left", padx=8)
 
@@ -803,6 +827,8 @@ class App:
         self.var_cooldown = tk.StringVar(value="10")
         self.var_roi_top = tk.StringVar(value="0")
         self.var_roi_bottom = tk.StringVar(value="100")
+        self.var_roi_left = tk.StringVar(value="0")
+        self.var_roi_right = tk.StringVar(value="100")
         spin(0, 0, "Tono (0-179):", self.var_hue, 0, 179)
         spin(0, 1, "± tolerancia:", self.var_hue_tol, 1, 60)
         spin(1, 0, "Saturación mín.:", self.var_sat, 0, 255)
@@ -811,8 +837,10 @@ class App:
         spin(2, 1, "Área máx. (px²):", self.var_area_max, 100, 5000000, 1000)
         spin(3, 0, "Lado de la imagen (px):", self.var_tpl_size, 12, 400, 4)
         spin(3, 1, "Parecido mín. (0-1):", self.var_tpl_thr, 0.5, 0.99, 0.01)
-        spin(4, 0, "Buscar desde (% alto):", self.var_roi_top, 0, 99)
-        spin(4, 1, "hasta (% alto):", self.var_roi_bottom, 1, 100)
+        spin(4, 0, "Zona: alto de % a %:", self.var_roi_top, 0, 99)
+        spin(4, 1, "", self.var_roi_bottom, 1, 100)
+        spin(7, 0, "Zona: ancho de % a %:", self.var_roi_left, 0, 99)
+        spin(7, 1, "", self.var_roi_right, 1, 100)
         spin(5, 0, "Escaneo cada (s):", self.var_interval, 0.2, 10, 0.1)
         spin(5, 1, "Cooldown (s):", self.var_cooldown, 1, 3600)
         spin(6, 0, "Lado máx. (px):", self.var_max_side, 10, 2000, 10)
@@ -907,6 +935,8 @@ class App:
             f.tpl_thr = float(self.var_tpl_thr.get())
             f.roi_top = float(self.var_roi_top.get()) / 100.0
             f.roi_bottom = float(self.var_roi_bottom.get()) / 100.0
+            f.roi_left = float(self.var_roi_left.get()) / 100.0
+            f.roi_right = float(self.var_roi_right.get()) / 100.0
             w.interval = max(0.2, float(self.var_interval.get()))
             w.cooldown = float(self.var_cooldown.get())
             w.double_click = self.var_double.get()
@@ -939,6 +969,58 @@ class App:
         self.log("PARADA TOTAL: " + (", ".join(paro) if paro
                                      else "no había nada activo") + ".")
         beep(False)
+
+    # ---------- zona de búsqueda ----------
+    def mark_zone(self):
+        """Marca el rectángulo de búsqueda con dos pulsaciones de F2.
+
+        Dos esquinas a golpe de tecla en vez de un arrastre: así funciona
+        igual de bien sobre un juego a pantalla completa, donde no se puede
+        dibujar un recuadro encima.
+        """
+        x, y = MouseController().position
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+        if self._zone_p1 is None:
+            self._zone_p1 = (x, y)
+            self.log(f"Zona: esquina 1 en ({x}, {y}). Lleva el ratón a la "
+                     f"esquina opuesta y pulsa F2 otra vez.")
+            beep(True)
+            return
+        x1, y1 = self._zone_p1
+        self._zone_p1 = None
+        left, right = sorted((x1 - mon["left"], x - mon["left"]))
+        top, bottom = sorted((y1 - mon["top"], y - mon["top"]))
+        if right - left < 20 or bottom - top < 20:
+            self.log("Zona demasiado pequeña; inténtalo otra vez con F2.")
+            beep(False)
+            return
+        # Los ajustes se guardan en % entero, y en 1920 px cada 1% son 19 px.
+        # Al redondear hay que crecer siempre hacia fuera: si se redondeara al
+        # más cercano, un borde en el 58.4% se guardaría como 58 y recortaría
+        # 11 px de lo que el usuario acaba de marcar, con el objetivo dentro.
+        self.var_roi_left.set(str(math.floor(left * 100 / mon["width"])))
+        self.var_roi_right.set(str(max(1, math.ceil(right * 100 / mon["width"]))))
+        self.var_roi_top.set(str(math.floor(top * 100 / mon["height"])))
+        self.var_roi_bottom.set(
+            str(max(1, math.ceil(bottom * 100 / mon["height"]))))
+        self._apply_settings()
+        f = self.finder
+        real_w = int((f.roi_right - f.roi_left) * mon["width"])
+        real_h = int((f.roi_bottom - f.roi_top) * mon["height"])
+        self.log(f"Zona de búsqueda fijada: marcaste {right - left}x"
+                 f"{bottom - top} px desde ({left}, {top}); se guarda como "
+                 f"{real_w}x{real_h} px (el % es entero, así que se redondea "
+                 f"hacia fuera). Fuera de ahí no mirará nada.")
+        beep(True)
+
+    def reset_zone(self):
+        self._zone_p1 = None
+        for var, val in ((self.var_roi_left, "0"), (self.var_roi_right, "100"),
+                         (self.var_roi_top, "0"), (self.var_roi_bottom, "100")):
+            var.set(val)
+        self._apply_settings()
+        self.log("Zona de búsqueda: toda la pantalla.")
 
     # ---------- cuentagotas / plantilla ----------
     def pick_color(self):
@@ -1192,6 +1274,7 @@ class App:
             HOTKEY_PICK: self.pick_color,
             HOTKEY_TEMPLATE: self.capture_template,
             HOTKEY_WATCH: self.toggle_watch,
+            HOTKEY_ZONE: self.mark_zone,
             HOTKEY_PANIC: self.panic,
         }
 
@@ -1211,6 +1294,7 @@ class App:
             "area": self.var_area, "area_max": self.var_area_max,
             "tpl_size": self.var_tpl_size, "tpl_thr": self.var_tpl_thr,
             "roi_top": self.var_roi_top, "roi_bottom": self.var_roi_bottom,
+            "roi_left": self.var_roi_left, "roi_right": self.var_roi_right,
             "max_side": self.var_max_side, "frames": self.var_frames,
             "interval": self.var_interval, "cooldown": self.var_cooldown,
             "repeats": self.var_repeats, "speed": self.var_speed,

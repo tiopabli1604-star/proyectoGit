@@ -26,6 +26,7 @@ referencia) y `golem_debug.png` (la última prueba de detección).
 | F6    | Empezar / parar grabación |
 | F7    | Reproducir / parar reproducción |
 | F8    | Cuentagotas: capturar el color bajo el ratón y calibrarse solo |
+| F2    | Marcar la zona de búsqueda (una esquina por pulsación) |
 | F4    | Capturar la imagen bajo el ratón como referencia |
 | F9    | Activar / desactivar el vigilante |
 | F12   | **Parada total de emergencia** |
@@ -59,13 +60,46 @@ verlo en **dos escaneos seguidos** antes de actuar, y luego respeta un tiempo de
 espera (cooldown) configurable. Puede devolver el ratón a donde estaba y pitar
 al clicar, y la barra de estado lleva la cuenta de clics y la hora del último.
 
-Además exige que el objetivo esté **sobre el gris de una interfaz**: mira un
-anillo alrededor de la mancha y comprueba que el fondo está casi sin saturación,
-como el panel de un cofre. Eso es lo que distingue un objeto en una casilla de un
-trozo de paisaje del mismo color — sin ese filtro, las hojas o el césped
-iluminados forman manchas del tamaño exacto de una casilla y se llevan el clic.
+Además exige que el objetivo esté **sobre el gris claro de una interfaz**: mira
+un anillo alrededor de la mancha y comprueba que el fondo está casi sin
+saturación **y es claro**, como el panel de un cofre. Los dos requisitos hacen
+falta por separado:
+
+- la **saturación** descarta el paisaje: sin ese filtro, las hojas o el césped
+  iluminados forman manchas del tamaño exacto de una casilla y se llevan el clic;
+- el **brillo** descarta el texto de colores del HUD (el nombre del bioma, los
+  marcadores del servidor), que también está sobre un fondo poco saturado, pero
+  oscuro.
+
 Si tu objetivo no está dentro de una interfaz, desmarca "Solo sobre una
 interfaz".
+
+### Marcar la zona de búsqueda (F2)
+
+El filtro anterior no lo arregla todo. Si en tu propio inventario hay otro objeto
+del mismo tono, los dos están sobre gris y el vigilante clicará el más grande de
+los dos, que no tiene por qué ser el bueno. Y si el paisaje del fondo es
+justamente de ese color — la hierba seca del bioma *Plains* es casi del mismo
+tono que un cristal verde lima — el color por sí solo no puede separarlos.
+
+La solución es decirle **dónde** mirar: pon el ratón en una esquina del área que
+te interesa y pulsa **F2**, lleva el ratón a la esquina opuesta y pulsa **F2**
+otra vez. A partir de ahí no mira nada de fuera de ese rectángulo. El botón
+**Toda la pantalla** lo deshace.
+
+Son dos pulsaciones en vez de un arrastre a propósito: así funciona igual de bien
+sobre un juego a pantalla completa, donde no se puede dibujar un recuadro encima.
+
+Cuanto más ajustada sea la zona, menos se puede equivocar. En el caso del cofre
+de Minecraft, marcar solo la rejilla del cofre — **sin incluir la fila de tu
+inventario** — deja el problema resuelto sin depender del color, porque dentro no
+hay nada más.
+
+La zona se guarda en porcentajes enteros de la pantalla, así que en 1920 px cada
+paso son unos 19 px. Al redondear crece siempre hacia fuera, nunca hacia dentro,
+para no recortar justo lo que acabas de marcar; el registro te dice los píxeles
+marcados y los que se han guardado. Por eso no merece la pena marcar un
+rectángulo mucho más pequeño que eso.
 
 Cada clic automático guarda además una captura marcada con una cruz roja donde ha
 clicado (`golem_clic_1.png` … `_3.png`, rotando). Es la forma de auditar un clic
@@ -131,9 +165,11 @@ que sabes si el problema es el umbral (bájalo) o la plantilla (recaptúrala).
 Cuando en el registro aparece más de un candidato y el correcto no es el nº 1
 (típico si tu inventario tiene otros objetos del mismo color):
 
-- **Buscar desde / hasta (% alto)** — limita la franja vertical de pantalla que
-  se analiza. Por ejemplo `0` a `65` ignora la mitad inferior, donde suele estar
-  tu propio inventario.
+- **Marcar zona (F2)** — es lo que más ayuda, y con diferencia. Encierra el área
+  donde aparece el objetivo y todo lo de fuera deja de existir.
+- **Zona: alto / ancho de % a %** — lo mismo a mano, si prefieres teclear los
+  números. Por ejemplo `0` a `65` de alto ignora la mitad inferior, donde suele
+  estar tu propio inventario.
 - **Área mín. / máx. (px²)** — el objeto de una casilla ronda unos cientos de
   px²; súbele el mínimo para descartar motas de color y bájale el máximo para
   descartar paredes o fondos grandes del mismo tono.
@@ -146,6 +182,19 @@ Cuando en el registro aparece más de un candidato y el correcto no es el nº 1
   un menú o un cofre.
 - O cambia al **modo Imagen de referencia**, que distingue la textura y no solo
   el tono (salvo con objetos encantados).
+
+### Receta corta
+
+Si lo que quieres es clicar un objeto que aparece en una casilla de un menú:
+
+1. Deja en pantalla el aviso, con el objeto visible.
+2. Ratón en una esquina de la rejilla → **F2**; ratón en la esquina opuesta →
+   **F2**. Deja fuera tu propio inventario.
+3. Ratón encima del objeto → **F8** (modo **Color**).
+4. **Probar detección (3 s)** y mira el registro: debería salir **un solo
+   candidato**, en las coordenadas del objeto. Si sale más de uno, aprieta la
+   zona.
+5. **F9** para activar la vigilancia, y ya se queda esperando.
 
 Los dos módulos conviven: el vigilante se pausa solo mientras grabas o
 reproduces una macro.
