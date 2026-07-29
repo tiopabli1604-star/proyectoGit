@@ -17,6 +17,7 @@ Hotkeys globales:
   F8  = cuentagotas: capturar el color bajo el ratón y calibrarse solo
   F4  = capturar plantilla: recorta la imagen bajo el ratón como referencia
   F9  = activar / desactivar el vigilante
+  F10 = ejecutar / parar el guion de varios pasos
   F12 = PARADA TOTAL de emergencia
 """
 
@@ -72,9 +73,10 @@ HOTKEY_PICK = keyboard.Key.f8
 HOTKEY_TEMPLATE = keyboard.Key.f4
 HOTKEY_WATCH = keyboard.Key.f9
 HOTKEY_ZONE = keyboard.Key.f2
+HOTKEY_SCRIPT = keyboard.Key.f10
 HOTKEY_PANIC = keyboard.Key.f12
 HOTKEYS = {HOTKEY_RECORD, HOTKEY_PLAY, HOTKEY_PICK, HOTKEY_TEMPLATE,
-           HOTKEY_WATCH, HOTKEY_ZONE, HOTKEY_PANIC}
+           HOTKEY_WATCH, HOTKEY_ZONE, HOTKEY_SCRIPT, HOTKEY_PANIC}
 
 SCALE = 0.5  # las capturas de color se analizan a media resolución
 
@@ -108,6 +110,32 @@ def precise_sleep_until(t_target, t0):
             time.sleep(remaining - 0.002)
         else:
             time.sleep(0)  # spin suave
+
+
+def click_at(mouse, x, y, boton="left", doble=False, restore=True,
+             move_delay=0.20):
+    """Mueve, clica y (si se pide) devuelve el ratón donde estaba.
+
+    Lo usan el vigilante y el guion, para que los dos tengan el mismo retardo
+    entre mover y pulsar: un juego a 60 fps tarda un fotograma o dos en
+    enterarse de que el cursor se ha movido, y si se pulsa antes el clic se
+    procesa con la casilla anterior bajo el ratón y no cuenta.
+    """
+    btn = getattr(Button, boton)
+    prev = mouse.position
+    mouse.position = (x, y)
+    time.sleep(move_delay)
+    mouse.press(btn)
+    time.sleep(0.06)
+    mouse.release(btn)
+    if doble:
+        time.sleep(0.10)
+        mouse.press(btn)
+        time.sleep(0.06)
+        mouse.release(btn)
+    if restore:
+        time.sleep(0.20)   # deja que el juego procese el clic antes de irse
+        mouse.position = prev
 
 
 def beep(ok=True):
@@ -218,6 +246,17 @@ class Player:
     def stop(self):
         self.playing = False
 
+    def play_sync(self, events, speed=1.0, repeats=1):
+        """Reproduce en el hilo actual y no vuelve hasta acabar.
+
+        La usa el guion, que necesita que un paso 'macro' termine antes de
+        pasar al siguiente.
+        """
+        if not events:
+            return
+        self.playing = True
+        self._run(events, speed, repeats)
+
     def _run(self, events, speed, repeats):
         loop = 0
         try:
@@ -326,6 +365,21 @@ class Finder:
         self.roi_right = 1.0
         self.rejects = []       # motivos de descarte del último escaneo
         self.load_template()
+
+    # claves que definen "qué buscar y dónde": un objetivo con nombre
+    PERFIL = ("mode", "hue", "hue_tol", "sat_min", "val_min", "min_area",
+              "max_area", "max_side", "frames", "on_gui", "tpl_thr",
+              "roi_left", "roi_right", "roi_top", "roi_bottom")
+
+    def snapshot(self):
+        """Los ajustes de búsqueda de ahora, para guardarlos como objetivo."""
+        return {k: getattr(self, k) for k in self.PERFIL}
+
+    def apply(self, perfil):
+        """Carga un objetivo guardado. Ignora claves que ya no existan."""
+        for k in self.PERFIL:
+            if k in perfil:
+                setattr(self, k, perfil[k])
 
     # ---- captura de pantalla ----
     @staticmethod
@@ -701,23 +755,8 @@ class Watcher:
                 beep(True)
 
     def _click(self, x, y):
-        prev = self.mouse.position
-        self.mouse.position = (x, y)
-        # Un juego a 60 fps tarda un fotograma o dos en enterarse de que el
-        # cursor se ha movido. Si pulsamos antes, el clic se procesa con la
-        # casilla anterior bajo el ratón y no cuenta.
-        time.sleep(self.move_delay)
-        self.mouse.press(Button.left)
-        time.sleep(0.06)
-        self.mouse.release(Button.left)
-        if self.double_click:
-            time.sleep(0.10)
-            self.mouse.press(Button.left)
-            time.sleep(0.06)
-            self.mouse.release(Button.left)
-        if self.restore_mouse:
-            time.sleep(0.20)   # deja que el juego procese el clic antes de irse
-            self.mouse.position = prev
+        click_at(self.mouse, x, y, doble=self.double_click,
+                 restore=self.restore_mouse, move_delay=self.move_delay)
 
     def _save_shot(self, x, y, n):
         """Guarda una captura marcando dónde va a clicar, para poder auditarlo."""
@@ -738,19 +777,459 @@ class Watcher:
             return None
 
 
+# ------------------------------------------------------------------- guion
+
+ALIAS_TECLA = {
+    "esc": "esc", "escape": "esc", "intro": "enter", "enter": "enter",
+    "espacio": "space", "space": "space", "tab": "tab", "supr": "delete",
+    "borrar": "backspace", "mayus": "shift", "shift": "shift",
+    "ctrl": "ctrl", "control": "ctrl", "alt": "alt",
+    "arriba": "up", "abajo": "down", "izquierda": "left", "derecha": "right",
+    "inicio": "home", "fin": "end",
+}
+
+
+def resolver_tecla(nombre):
+    """Nombre escrito en el guion -> tecla de pynput. Lanza ValueError."""
+    n = nombre.strip().lower()
+    if len(n) == 1:
+        return n
+    n = ALIAS_TECLA.get(n, n)
+    try:
+        return getattr(keyboard.Key, n)
+    except AttributeError:
+        raise ValueError(f"no conozco la tecla '{nombre}'")
+
+
+class Script:
+    """Guion de varios pasos: busca, clica, espera, salta, repite.
+
+    El vigilante solo sabe "veo esto -> clico esto". Esto encadena pasos y
+    permite volver atrás, que es lo que hace falta para una tarea con estados
+    (esperar algo, actuar, comprobar el resultado, volver a empezar).
+
+    Cada paso que busca algo se refiere a un *objetivo* con nombre, que es una
+    copia guardada de los ajustes de búsqueda (zona incluida). Así un mismo
+    guion puede mirar sitios distintos con criterios distintos.
+    """
+
+    BLOQUEANTES = ("buscar", "desaparecer", "esperar", "macro")
+    POLITICAS = ("parar", "seguir", "repetir", "ir")
+
+    def __init__(self, log_fn, targets, status_fn=None, on_finish=None):
+        self.log = log_fn
+        self.targets = targets          # nombre -> perfil del Finder
+        self.status = status_fn
+        self.on_finish = on_finish
+        self.finder = Finder()
+        self.mouse = MouseController()
+        self.keyboard = KeyboardController()
+        self.steps = []
+        self.interval = 0.5             # s entre comprobaciones de 'buscar'
+        self.confirmaciones = 2         # escaneos seguidos antes de dar por visto
+        self.move_delay = 0.20
+        self.restore_mouse = True
+        self.sound = True
+        self.running = False
+        self._stop = threading.Event()
+        self._thread = None
+        self.last_pos = None
+        self.pasos_hechos = 0
+
+    # ---------- análisis ----------
+    @classmethod
+    def parse(cls, texto, targets):
+        """Devuelve (pasos, errores). Cada error es un texto ya legible."""
+        pasos, errores = [], []
+        for nlin, cruda in enumerate(texto.splitlines(), 1):
+            linea = cruda.strip()
+            if not linea or linea.startswith("#"):
+                continue
+            op = linea.split()[0].lower()
+
+            if op == "escribir":
+                # el texto va literal, sin tocar: puede llevar # y espacios
+                resto = linea[len("escribir"):].strip()
+                if not resto:
+                    errores.append(f"línea {nlin}: 'escribir' sin texto")
+                    continue
+                pasos.append({"op": "escribir", "texto": resto, "lin": nlin,
+                              "raw": linea})
+                continue
+
+            partes = linea.split("#")[0].split()
+            if not partes:
+                continue
+            op = partes[0].lower()
+            args = partes[1:]
+            p = {"op": op, "lin": nlin, "raw": " ".join(partes)}
+
+            if op in ("buscar", "desaparecer"):
+                if not args:
+                    errores.append(f"línea {nlin}: '{op}' necesita el nombre "
+                                   f"de un objetivo")
+                    continue
+                p["objetivo"] = args[0]
+                if args[0] not in targets:
+                    disp = ", ".join(sorted(targets)) or "ninguno todavía"
+                    errores.append(f"línea {nlin}: no hay un objetivo llamado "
+                                   f"'{args[0]}' (guardados: {disp})")
+                p["timeout"] = None
+                p["politica"] = ("parar", None)
+                rest = args[1:]
+                if rest and rest[0].lower() != "si_falla":
+                    try:
+                        p["timeout"] = float(rest[0].replace(",", "."))
+                        if p["timeout"] <= 0:
+                            raise ValueError
+                    except ValueError:
+                        errores.append(f"línea {nlin}: '{rest[0]}' no es un "
+                                       f"número de segundos")
+                    rest = rest[1:]
+                if rest:
+                    if rest[0].lower() != "si_falla":
+                        errores.append(f"línea {nlin}: no entiendo "
+                                       f"'{' '.join(rest)}'")
+                    elif len(rest) < 2 or rest[1].lower() not in cls.POLITICAS:
+                        errores.append(f"línea {nlin}: tras 'si_falla' pon "
+                                       f"parar, seguir, repetir o 'ir <nº>'")
+                    elif rest[1].lower() == "ir":
+                        if len(rest) < 3 or not rest[2].isdigit():
+                            errores.append(f"línea {nlin}: 'si_falla ir' "
+                                           f"necesita un número de paso")
+                        else:
+                            p["politica"] = ("ir", int(rest[2]))
+                    else:
+                        p["politica"] = (rest[1].lower(), None)
+                    if p["timeout"] is None and p["politica"][0] != "parar":
+                        errores.append(f"línea {nlin}: 'si_falla' no sirve sin "
+                                       f"un límite de segundos, porque sin él "
+                                       f"espera para siempre")
+
+            elif op == "clic":
+                p["boton"] = "left"
+                p["doble"] = False
+                for a in args:
+                    al = a.lower()
+                    if al == "doble":
+                        p["doble"] = True
+                    elif al == "derecho":
+                        p["boton"] = "right"
+                    elif al == "medio":
+                        p["boton"] = "middle"
+                    else:
+                        errores.append(f"línea {nlin}: no entiendo '{a}' en "
+                                       f"'clic' (usa doble, derecho o medio)")
+
+            elif op == "esperar":
+                if len(args) != 1:
+                    errores.append(f"línea {nlin}: 'esperar' necesita los "
+                                   f"segundos")
+                else:
+                    try:
+                        p["segundos"] = float(args[0].replace(",", "."))
+                        if p["segundos"] < 0:
+                            raise ValueError
+                    except ValueError:
+                        errores.append(f"línea {nlin}: '{args[0]}' no es un "
+                                       f"número de segundos")
+
+            elif op == "tecla":
+                if len(args) != 1:
+                    errores.append(f"línea {nlin}: 'tecla' necesita una tecla")
+                else:
+                    try:
+                        resolver_tecla(args[0])
+                        p["tecla"] = args[0]
+                    except ValueError as exc:
+                        errores.append(f"línea {nlin}: {exc}")
+
+            elif op == "macro":
+                if len(args) != 1:
+                    errores.append(f"línea {nlin}: 'macro' necesita el nombre "
+                                   f"del archivo .macro.json")
+                else:
+                    p["archivo"] = args[0]
+                    ruta = (args[0] if os.path.isabs(args[0])
+                            else os.path.join(APP_DIR, args[0]))
+                    if not os.path.exists(ruta):
+                        errores.append(f"línea {nlin}: no encuentro "
+                                       f"'{ruta}'")
+                    p["ruta"] = ruta
+
+            elif op == "ir":
+                if len(args) != 1 or not args[0].isdigit():
+                    errores.append(f"línea {nlin}: 'ir' necesita un número de "
+                                   f"paso")
+                else:
+                    p["destino"] = int(args[0])
+
+            elif op in ("repetir", "parar", "pitar"):
+                if args:
+                    errores.append(f"línea {nlin}: '{op}' no lleva nada detrás")
+
+            else:
+                errores.append(f"línea {nlin}: no conozco la instrucción "
+                               f"'{op}'")
+                continue
+
+            pasos.append(p)
+
+        if not pasos and not errores:
+            errores.append("el guion está vacío")
+
+        # los saltos se comprueban al final, cuando ya sabemos cuántos pasos hay
+        for i, p in enumerate(pasos, 1):
+            destinos = []
+            if p["op"] == "ir":
+                destinos.append(p.get("destino"))
+            if p["op"] in ("buscar", "desaparecer") and \
+                    p.get("politica", ("parar",))[0] == "ir":
+                destinos.append(p["politica"][1])
+            for d in destinos:
+                if d is not None and not (1 <= d <= len(pasos)):
+                    errores.append(f"línea {p['lin']}: el paso {d} no existe "
+                                   f"(el guion tiene {len(pasos)})")
+
+        # un 'clic' sin un 'buscar' antes no sabe dónde clicar
+        visto_buscar = False
+        for p in pasos:
+            if p["op"] == "buscar":
+                visto_buscar = True
+            elif p["op"] == "clic" and not visto_buscar:
+                errores.append(f"línea {p['lin']}: 'clic' sin un 'buscar' "
+                               f"antes: no sabría dónde clicar")
+                break
+
+        # un bucle sin nada que espere se comería la CPU y clicaría sin parar
+        hay_bucle = any(p["op"] == "repetir" or
+                        (p["op"] == "ir" and p.get("destino", 99) <= i)
+                        for i, p in enumerate(pasos, 1))
+        if hay_bucle and not any(p["op"] in cls.BLOQUEANTES for p in pasos):
+            errores.append("el guion se repite pero no espera nada: añade un "
+                           "'buscar' o un 'esperar' o se disparará sin freno")
+        return pasos, errores
+
+    @staticmethod
+    def describe(pasos):
+        """Los pasos en palabras, numerados como los ve el motor."""
+        out = []
+        for i, p in enumerate(pasos, 1):
+            op = p["op"]
+            if op == "buscar":
+                t = (f"hasta {p['timeout']:g} s" if p["timeout"]
+                     else "esperando lo que haga falta")
+                pol = p["politica"]
+                fin = {"parar": "para el guion", "seguir": "sigue igual",
+                       "repetir": "vuelve al paso 1",
+                       "ir": f"salta al paso {pol[1]}"}[pol[0]]
+                txt = (f"espera a ver '{p['objetivo']}' ({t}); "
+                       f"si no aparece, {fin}")
+            elif op == "desaparecer":
+                t = (f"hasta {p['timeout']:g} s" if p["timeout"] else "sin límite")
+                txt = f"espera a que '{p['objetivo']}' desaparezca ({t})"
+            elif op == "clic":
+                q = "doble clic" if p["doble"] else "clic"
+                b = {"left": "", "right": " derecho", "middle": " central"}[p["boton"]]
+                txt = f"{q}{b} donde se vio el último objetivo"
+            elif op == "esperar":
+                txt = f"espera {p['segundos']:g} s"
+            elif op == "tecla":
+                txt = f"pulsa la tecla {p['tecla']}"
+            elif op == "escribir":
+                txt = f"escribe «{p['texto']}»"
+            elif op == "macro":
+                txt = f"reproduce la macro {os.path.basename(p['ruta'])}"
+            elif op == "pitar":
+                txt = "pita"
+            elif op == "ir":
+                txt = f"salta al paso {p['destino']}"
+            elif op == "repetir":
+                txt = "vuelve al paso 1"
+            else:
+                txt = "para"
+            out.append(f"{i}. {txt}")
+        return out
+
+    # ---------- ejecución ----------
+    def load(self, texto):
+        pasos, errores = self.parse(texto, self.targets)
+        if errores:
+            return errores
+        self.steps = pasos
+        return []
+
+    def start(self):
+        if self.running or not self.steps:
+            return False
+        self._stop.clear()
+        self.running = True
+        self.pasos_hechos = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self):
+        self._stop.set()
+        self.running = False
+
+    def _esperar(self, seg):
+        """Como sleep, pero se corta al parar."""
+        return not self._stop.wait(max(0.0, seg))
+
+    def _buscar(self, paso, quiero_verlo):
+        """Espera a que el objetivo aparezca (o desaparezca). Devuelve
+        (resuelto, candidato)."""
+        self.finder.apply(self.targets[paso["objetivo"]])
+        t0 = time.perf_counter()
+        prev = None
+        seguidos = 0
+        while not self._stop.is_set():
+            try:
+                c = self.finder.candidates()
+            except Exception as exc:
+                self.log(f"   error al buscar '{paso['objetivo']}': {exc}")
+                return False, None
+            if quiero_verlo:
+                if c:
+                    x, y = c[0][0], c[0][1]
+                    if prev and abs(prev[0] - x) <= 40 and abs(prev[1] - y) <= 40:
+                        seguidos += 1
+                    else:
+                        seguidos = 1
+                    prev = (x, y)
+                    if seguidos >= max(1, self.confirmaciones):
+                        return True, c[0]
+                else:
+                    prev, seguidos = None, 0
+            else:
+                if not c:
+                    return True, None
+            if paso["timeout"] and time.perf_counter() - t0 >= paso["timeout"]:
+                return False, None
+            if not self._esperar(self.interval):
+                return False, None
+        return False, None
+
+    def _run(self):
+        i = 0
+        try:
+            while not self._stop.is_set() and 0 <= i < len(self.steps):
+                paso = self.steps[i]
+                op = paso["op"]
+                n = i + 1
+                if self.status:
+                    self.status(f"GUION — paso {n}/{len(self.steps)}: "
+                                f"{paso['raw']}")
+
+                if op in ("buscar", "desaparecer"):
+                    ok, cand = self._buscar(paso, op == "buscar")
+                    if self._stop.is_set():
+                        break
+                    if ok:
+                        if cand:
+                            self.last_pos = (cand[0], cand[1])
+                            self.log(f"{n}. visto '{paso['objetivo']}' en "
+                                     f"({cand[0]}, {cand[1]})")
+                        else:
+                            self.log(f"{n}. '{paso['objetivo']}' ha "
+                                     f"desaparecido")
+                        i += 1
+                    else:
+                        pol, dest = paso["politica"]
+                        self.log(f"{n}. no apareció '{paso['objetivo']}' en "
+                                 f"{paso['timeout']:g} s → {pol}"
+                                 if paso["timeout"] else
+                                 f"{n}. búsqueda cortada")
+                        if pol == "parar":
+                            break
+                        i = (0 if pol == "repetir"
+                             else dest - 1 if pol == "ir" else i + 1)
+
+                elif op == "clic":
+                    if self.last_pos is None:
+                        self.log(f"{n}. no hay ninguna posición donde clicar; "
+                                 f"paro.")
+                        break
+                    x, y = self.last_pos
+                    click_at(self.mouse, x, y, boton=paso["boton"],
+                             doble=paso["doble"], restore=self.restore_mouse,
+                             move_delay=self.move_delay)
+                    self.log(f"{n}. clic en ({x}, {y})")
+                    if self.sound:
+                        beep(True)
+                    i += 1
+
+                elif op == "esperar":
+                    self.log(f"{n}. esperando {paso['segundos']:g} s")
+                    if not self._esperar(paso["segundos"]):
+                        break
+                    i += 1
+
+                elif op == "tecla":
+                    k = resolver_tecla(paso["tecla"])
+                    self.keyboard.press(k)
+                    time.sleep(0.05)
+                    self.keyboard.release(k)
+                    self.log(f"{n}. tecla {paso['tecla']}")
+                    i += 1
+
+                elif op == "escribir":
+                    self.keyboard.type(paso["texto"])
+                    self.log(f"{n}. escrito «{paso['texto']}»")
+                    i += 1
+
+                elif op == "macro":
+                    self.log(f"{n}. reproduciendo "
+                             f"{os.path.basename(paso['ruta'])}")
+                    try:
+                        with open(paso["ruta"], encoding="utf-8-sig") as f:
+                            ev = json.load(f).get("events", [])
+                        Player().play_sync(ev)
+                    except Exception as exc:
+                        self.log(f"   no pude reproducirla: {exc}; paro.")
+                        break
+                    i += 1
+
+                elif op == "pitar":
+                    beep(True)
+                    i += 1
+
+                elif op == "ir":
+                    i = paso["destino"] - 1
+
+                elif op == "repetir":
+                    i = 0
+
+                else:                      # parar
+                    self.log(f"{n}. parar")
+                    break
+                self.pasos_hechos += 1
+        except Exception as exc:
+            self.log(f"El guion se ha cortado por un error: {exc}")
+        finally:
+            self.running = False
+            self._stop.set()
+            if self.on_finish:
+                self.on_finish()
+
+
 # ---------------------------------------------------------------- GUI
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title(f"{APP_NAME} — automatiza clics y macros")
-        root.geometry("600x820")
+        root.geometry("640x840")
 
         self.recorder = Recorder()
         self.player = Player(on_finish=self._on_play_finish,
                              on_progress=self._on_play_progress)
         self.finder = Finder()
         self.watcher = Watcher(self.finder, self.log, self.set_status)
+        self.targets = {}          # nombre -> perfil del Finder
+        self.script = Script(self.log, self.targets, self.set_status,
+                             on_finish=self._on_script_finish)
         self.events = []
         self.current_file = None
         self._zone_p1 = None
@@ -763,7 +1242,7 @@ class App:
         self._start_hotkeys()
         self.log(f"{APP_NAME} listo. F6 grabar | F7 reproducir | "
                  f"F2 marcar zona | F8 cuentagotas | F4 plantilla | "
-                 f"F9 vigilar | F12 PARAR")
+                 f"F9 vigilar | F10 guion | F12 PARAR")
         if self._migrado:
             self.log("He cambiado tus ajustes al modo nuevo 'lo único con "
                      "color': dentro de la zona que marques clica lo único que "
@@ -821,9 +1300,14 @@ class App:
         self.lbl_macro = ttk.Label(fm, text="Sin macro cargada")
         self.lbl_macro.pack(anchor="w", **pad)
 
-        # --- sección vigilante ---
-        fc = ttk.LabelFrame(self.root, text=" Vigilante (clic automático) ")
-        fc.pack(fill="x", **pad)
+        # --- pestañas: vigilante y guion ---
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="x", **pad)
+        fc = ttk.Frame(nb)
+        nb.add(fc, text="  Vigilante (un solo clic)  ")
+        fg = ttk.Frame(nb)
+        nb.add(fg, text="  Guion (varios pasos)  ")
+        self._build_script_tab(fg, pad)
 
         rowm = ttk.Frame(fc)
         rowm.pack(fill="x", **pad)
@@ -954,6 +1438,43 @@ class App:
                                 text="Inactivo")
         self.status.pack(fill="x", side="bottom")
 
+    def _build_script_tab(self, fg, pad):
+        r0 = ttk.Frame(fg)
+        r0.pack(fill="x", **pad)
+        ttk.Label(r0, text="Objetivos guardados:").pack(side="left")
+        self.var_target = tk.StringVar()
+        self.cmb_targets = ttk.Combobox(r0, textvariable=self.var_target,
+                                        width=16, state="readonly")
+        self.cmb_targets.pack(side="left", padx=4)
+        ttk.Button(r0, text="Borrar", width=7,
+                   command=self.delete_target).pack(side="left", padx=2)
+
+        r1 = ttk.Frame(fg)
+        r1.pack(fill="x", **pad)
+        ttk.Label(r1, text="Guardar lo de la otra pestaña como:").pack(
+            side="left")
+        self.var_new_target = tk.StringVar()
+        ttk.Entry(r1, textvariable=self.var_new_target, width=14).pack(
+            side="left", padx=4)
+        ttk.Button(r1, text="Guardar objetivo",
+                   command=self.save_target).pack(side="left", padx=2)
+
+        self.txt_script = tk.Text(fg, height=9, font=("Consolas", 9),
+                                  undo=True)
+        self.txt_script.pack(fill="both", expand=True, padx=8, pady=4)
+
+        r2 = ttk.Frame(fg)
+        r2.pack(fill="x", **pad)
+        ttk.Button(r2, text="Comprobar",
+                   command=self.check_script).pack(side="left", padx=4)
+        self.btn_script = ttk.Button(r2, text="▶ Ejecutar guion (F10)",
+                                     command=self.toggle_script)
+        self.btn_script.pack(side="left", padx=4)
+        ttk.Button(r2, text="Instrucciones",
+                   command=self.script_help).pack(side="left", padx=4)
+        ttk.Button(r2, text="Ejemplo",
+                   command=self.script_example).pack(side="left", padx=4)
+
     # ---------- helpers ----------
     def log(self, msg):
         linea = time.strftime("[%H:%M:%S] ") + msg
@@ -963,7 +1484,13 @@ class App:
             self.txt_log.insert("end", linea + "\n")
             self.txt_log.see("end")
             self.txt_log.configure(state="disabled")
-        self.root.after(0, _append)
+        # Los hilos del vigilante y del guion registran cosas, y pueden hacerlo
+        # justo mientras se cierra la ventana: entonces el root ya no existe y
+        # after() lanzaría TclError dentro de ese hilo.
+        try:
+            self.root.after(0, _append)
+        except Exception:
+            pass
         if getattr(self, "var_logfile", None) and self.var_logfile.get():
             try:
                 with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -972,7 +1499,10 @@ class App:
                 pass
 
     def set_status(self, text):
-        self.root.after(0, lambda: self.status.configure(text=text))
+        try:
+            self.root.after(0, lambda: self.status.configure(text=text))
+        except Exception:
+            pass
 
     def _apply_topmost(self):
         self.root.attributes("-topmost", self.var_topmost.get())
@@ -1009,6 +1539,10 @@ class App:
     # ---------- parada de emergencia ----------
     def panic(self):
         paro = []
+        if self.script.running:
+            self.script.stop()
+            self.btn_script.configure(text="▶ Ejecutar guion (F10)")
+            paro.append("guion")
         if self.player.playing:
             self.player.stop()
             paro.append("reproducción")
@@ -1028,6 +1562,132 @@ class App:
         self.log("PARADA TOTAL: " + (", ".join(paro) if paro
                                      else "no había nada activo") + ".")
         beep(False)
+
+    # ---------- guion ----------
+    def _refresh_targets(self):
+        nombres = sorted(self.targets)
+        self.cmb_targets.configure(values=nombres)
+        if self.var_target.get() not in nombres:
+            self.var_target.set(nombres[0] if nombres else "")
+
+    def save_target(self):
+        nombre = self.var_new_target.get().strip()
+        if not nombre:
+            self.log("Ponle un nombre al objetivo antes de guardarlo.")
+            return
+        if " " in nombre:
+            self.log("El nombre no puede llevar espacios (en el guion se "
+                     "escribe suelto): usa por ejemplo 'cristal_cofre'.")
+            return
+        self._apply_settings()
+        nuevo = nombre not in self.targets
+        self.targets[nombre] = self.finder.snapshot()
+        self._refresh_targets()
+        self.var_target.set(nombre)
+        self.var_new_target.set("")
+        f = self.finder
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+        zona = ("toda la pantalla"
+                if (f.roi_left, f.roi_right, f.roi_top, f.roi_bottom)
+                == (0.0, 1.0, 0.0, 1.0)
+                else f"{int((f.roi_right - f.roi_left) * mon['width'])}x"
+                     f"{int((f.roi_bottom - f.roi_top) * mon['height'])} px")
+        self.log(f"Objetivo '{nombre}' {'guardado' if nuevo else 'actualizado'}: "
+                 f"modo {f.mode}, zona {zona}. Ya puedes usarlo en el guion, "
+                 f"por ejemplo: buscar {nombre}")
+        beep(True)
+
+    def delete_target(self):
+        nombre = self.var_target.get()
+        if nombre in self.targets:
+            del self.targets[nombre]
+            self._refresh_targets()
+            self.log(f"Objetivo '{nombre}' borrado.")
+        else:
+            self.log("No hay ningún objetivo seleccionado.")
+
+    def script_help(self):
+        for l in ("Instrucciones del guion (una por línea, # para comentarios):",
+                  "   buscar <objetivo> [segundos] [si_falla parar|seguir|"
+                  "repetir|ir <nº>]",
+                  "   desaparecer <objetivo> [segundos]",
+                  "   clic [doble|derecho|medio]   ← donde se vio el último "
+                  "objetivo",
+                  "   esperar <segundos>",
+                  "   tecla <nombre>               ← esc, intro, espacio, f, 1…",
+                  "   escribir <texto>",
+                  "   macro <archivo.macro.json>",
+                  "   pitar",
+                  "   ir <nº> / repetir / parar",
+                  "Sin segundos, 'buscar' espera indefinidamente. Los números "
+                  "de paso son los que muestra 'Comprobar'."):
+            self.log(l)
+
+    def script_example(self):
+        nombre = self.var_target.get() or "cristal"
+        ejemplo = (f"# espera el aviso, lo clica y vuelve a esperar\n"
+                   f"buscar {nombre}\n"
+                   f"clic\n"
+                   f"esperar 2\n"
+                   f"desaparecer {nombre} 30\n"
+                   f"repetir\n")
+        self.txt_script.delete("1.0", "end")
+        self.txt_script.insert("1.0", ejemplo)
+        self.log("Ejemplo puesto en el guion. Pulsa 'Comprobar' para ver qué "
+                 "haría, paso por paso, sin ejecutarlo.")
+
+    def check_script(self):
+        texto = self.txt_script.get("1.0", "end")
+        pasos, errores = Script.parse(texto, self.targets)
+        if errores:
+            self.log(f"El guion tiene {len(errores)} problema(s):")
+            for e in errores:
+                self.log("   · " + e)
+            beep(False)
+            return False
+        self.log(f"El guion está bien. {len(pasos)} paso(s):")
+        for l in Script.describe(pasos):
+            self.log("   " + l)
+        return True
+
+    def toggle_script(self):
+        if self.script.running:
+            self.script.stop()
+            self.log("Guion parado.")
+            self.btn_script.configure(text="▶ Ejecutar guion (F10)")
+            self.set_status("Inactivo")
+            return
+        if self.recorder.recording or self.player.playing:
+            self.log("No lanzo el guion mientras se graba o se reproduce una "
+                     "macro.")
+            return
+        if self.watcher.active:
+            self.log("Desactiva la vigilancia (F9) antes de lanzar el guion: "
+                     "los dos quieren mover el ratón.")
+            return
+        texto = self.txt_script.get("1.0", "end")
+        errores = self.script.load(texto)
+        if errores:
+            self.log(f"No lanzo el guion, tiene {len(errores)} problema(s):")
+            for e in errores:
+                self.log("   · " + e)
+            beep(False)
+            return
+        self.script.restore_mouse = self.var_restore.get()
+        self.script.sound = self.var_sound.get()
+        self.script.interval = max(0.05, float(self.var_interval.get() or 1.0))
+        if self.script.start():
+            self.btn_script.configure(text="■ Parar guion (F10)")
+            self.log(f"Guion en marcha ({len(self.script.steps)} pasos). "
+                     f"F10 o F12 para pararlo.")
+
+    def _on_script_finish(self):
+        def _fin():
+            self.btn_script.configure(text="▶ Ejecutar guion (F10)")
+            self.set_status("Inactivo")
+            self.log("Guion terminado.")
+        self.root.after(0, _fin)
 
     def _on_mode_change(self):
         self._apply_settings()
@@ -1364,13 +2024,14 @@ class App:
 
     # ---------- hotkeys ----------
     def _start_hotkeys(self):
-        acciones = {
+        self._acciones = acciones = {
             HOTKEY_RECORD: self.toggle_record,
             HOTKEY_PLAY: self.toggle_play,
             HOTKEY_PICK: self.pick_color,
             HOTKEY_TEMPLATE: self.capture_template,
             HOTKEY_WATCH: self.toggle_watch,
             HOTKEY_ZONE: self.mark_zone,
+            HOTKEY_SCRIPT: self.toggle_script,
             HOTKEY_PANIC: self.panic,
         }
 
@@ -1427,6 +2088,14 @@ class App:
         self.var_shots.set(cfg.get("shots", True))
         self.var_topmost.set(cfg.get("topmost", False))
         self.var_logfile.set(cfg.get("logfile", True))
+        guardados = cfg.get("targets")
+        if isinstance(guardados, dict):
+            self.targets.clear()          # el Script comparte este mismo dict
+            self.targets.update(guardados)
+        self._refresh_targets()
+        if isinstance(cfg.get("script"), str) and cfg["script"].strip():
+            self.txt_script.delete("1.0", "end")
+            self.txt_script.insert("1.0", cfg["script"])
         self._apply_topmost()
         self._apply_settings()
 
@@ -1440,6 +2109,8 @@ class App:
         cfg["shots"] = self.var_shots.get()
         cfg["topmost"] = self.var_topmost.get()
         cfg["logfile"] = self.var_logfile.get()
+        cfg["targets"] = self.targets
+        cfg["script"] = self.txt_script.get("1.0", "end").rstrip()
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
@@ -1449,6 +2120,7 @@ class App:
     def _on_close(self):
         self._save_config()
         self._sched_stop.set()
+        self.script.stop()
         self.player.stop()
         self.watcher.stop()
         if self.recorder.recording:

@@ -1,9 +1,14 @@
 # Golem
 
 Un gólem es un autómata al que le enseñas una tarea y la repite por ti. Esto es
-eso: un grabador de macros para Windows (estilo TinyTask, pero sin que la
-grabación se corrompa) más un **vigilante de pantalla** que detecta un objeto por
-su color o por su imagen y hace clic en él automáticamente, esté donde esté.
+eso, en tres piezas:
+
+- un **grabador de macros** para Windows (estilo TinyTask, pero sin que la
+  grabación se corrompa si mueves el ratón);
+- un **vigilante de pantalla** que encuentra un objeto y hace clic en él
+  automáticamente, esté donde esté;
+- un **guion** de varios pasos, con esperas, condiciones y bucles, para tareas
+  que no se resuelven con un solo clic.
 
 ## Instalación rápida (sin Python)
 
@@ -29,6 +34,7 @@ referencia) y `golem_debug.png` (la última prueba de detección).
 | F8    | Cuentagotas: capturar el color bajo el ratón y calibrarse solo |
 | F4    | Capturar la imagen bajo el ratón como referencia |
 | F9    | Activar / desactivar el vigilante |
+| F10   | Ejecutar / parar el guion de varios pasos |
 | F12   | **Parada total de emergencia** |
 
 Funcionan aunque la ventana del programa no esté en primer plano. **F12** corta
@@ -221,6 +227,82 @@ para saber si el problema es la zona o un umbral.
 
 Los dos módulos conviven: el vigilante se pausa solo mientras grabas o
 reproduces una macro.
+
+## Guion (varios pasos)
+
+El vigilante sabe hacer una cosa: *veo esto → clico esto*. El guion encadena
+pasos y puede volver atrás, que es lo que hace falta para una tarea con estados:
+espera algo, actúa, comprueba el resultado, vuelve a empezar.
+
+### Objetivos con nombre
+
+Un guion puede mirar sitios distintos con criterios distintos, así que primero se
+guardan los objetivos. En la pestaña **Vigilante** dejas puesto lo que quieres
+buscar (modo, zona con F2, umbrales), y en la pestaña **Guion** le pones un
+nombre y pulsas **Guardar objetivo**. Queda una copia de todos esos ajustes,
+zona incluida, y se guarda con la configuración.
+
+El nombre va sin espacios, porque en el guion se escribe suelto.
+
+### Instrucciones
+
+Una por línea. Todo lo que vaya tras `#` es un comentario.
+
+| Instrucción | Qué hace |
+|---|---|
+| `buscar <objetivo> [segundos] [si_falla …]` | Espera a que aparezca. Sin segundos, espera indefinidamente. Deja apuntada su posición. |
+| `desaparecer <objetivo> [segundos]` | Espera a que deje de verse. |
+| `clic [doble\|derecho\|medio]` | Clica donde se vio el último objetivo. |
+| `esperar <segundos>` | Pausa. |
+| `tecla <nombre>` | Pulsa una tecla: `esc`, `intro`, `espacio`, `f`, `1`… |
+| `escribir <texto>` | Teclea el texto tal cual. |
+| `macro <archivo.macro.json>` | Reproduce una macro grabada y espera a que acabe. |
+| `pitar` | Un pitido, para saber por dónde va sin mirar. |
+| `ir <nº>` / `repetir` / `parar` | Salta a un paso, vuelve al 1, o termina. |
+
+En `si_falla` puedes poner `parar` (lo que hace por defecto), `seguir`, `repetir`
+o `ir <nº>`. Solo tiene sentido con un límite de segundos: sin él la búsqueda no
+falla nunca porque espera para siempre.
+
+El caso del captcha queda así:
+
+```
+buscar cristal
+clic
+esperar 2
+desaparecer cristal 30
+repetir
+```
+
+### Comprobar antes de ejecutar
+
+**Comprobar** analiza el guion sin ejecutarlo y te lo cuenta en palabras, paso
+por paso y numerado:
+
+```
+1. espera a ver 'cristal' (esperando lo que haga falta); si no aparece, para el guion
+2. clic donde se vio el último objetivo
+3. espera 2 s
+4. espera a que 'cristal' desaparezca (hasta 30 s)
+5. vuelve al paso 1
+```
+
+Los números son los que usan `ir` y `si_falla ir`. Si algo está mal, te dice la
+línea y qué le pasa, en vez de fallar a medias con el ratón en marcha.
+
+Hay dos comprobaciones que evitan estropicios: un `clic` sin un `buscar` antes se
+rechaza (no sabría dónde clicar), y un bucle que no espera nada tampoco se acepta,
+porque se dispararía sin freno.
+
+### Ejecutar
+
+**F10** lo lanza y lo para. No arranca si está grabando, reproduciendo o con la
+vigilancia activa, porque los dos querrían mover el ratón. **F12** lo corta como
+todo lo demás.
+
+Cada paso se ve en el registro con su número y lo que ha hecho, y la barra de
+estado dice en qué paso va. Igual que el vigilante, `buscar` exige ver el
+objetivo en **dos escaneos seguidos** antes de darlo por bueno.
 
 ## Ejecutar desde el código fuente
 
