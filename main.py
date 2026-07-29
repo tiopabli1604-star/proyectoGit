@@ -1161,6 +1161,39 @@ def resolver_tecla(nombre):
         raise ValueError(f"no conozco la tecla '{nombre}'")
 
 
+def turn_camera(dx, dy, paso_max=15, gap=0.008, espera=None):
+    """Gira la cámara repartiendo el desplazamiento en varios envíos.
+
+    Un solo salto grande no vale: muchos juegos limitan cuánto puede girar la
+    vista en un fotograma, y el resto se pierde. Se reparte como lo haría un
+    ratón de verdad (unos 125 envíos por segundo).
+
+    El total sumado es **exactamente** el pedido: cada envío se calcula contra
+    el objetivo acumulado, así que los restos del redondeo se arrastran en vez
+    de perderse. Devuelve lo realmente enviado.
+
+    'espera' es la función de espera cortable del guion; si devuelve False se
+    interrumpe el giro a medias.
+    """
+    dx, dy = int(dx), int(dy)
+    if dx == 0 and dy == 0:
+        return 0, 0
+    n = max(1, math.ceil(max(abs(dx), abs(dy)) / max(1, paso_max)))
+    hecho_x = hecho_y = 0
+    for i in range(1, n + 1):
+        obj_x = round(dx * i / n)
+        obj_y = round(dy * i / n)
+        move_relative(obj_x - hecho_x, obj_y - hecho_y)
+        hecho_x, hecho_y = obj_x, obj_y
+        if i < n:
+            if espera is not None:
+                if not espera(gap):
+                    break
+            else:
+                time.sleep(gap)
+    return hecho_x, hecho_y
+
+
 def type_text(kb, texto, tecla_antes=None, intro=True, delay_char=0.02,
               delay_ui=0.30):
     """Teclea un texto como lo haría una persona, no de un volcado.
@@ -1201,7 +1234,6 @@ class Script:
     guion puede mirar sitios distintos con criterios distintos.
     """
 
-    BLOQUEANTES = ("buscar", "desaparecer", "esperar", "macro")
     POLITICAS = ("parar", "seguir", "repetir", "ir")
 
     def __init__(self, log_fn, targets, status_fn=None, on_finish=None):
@@ -1223,6 +1255,11 @@ class Script:
         self._thread = None
         self.last_pos = None
         self.pasos_hechos = 0
+        # lo que se deja pulsado hay que soltarlo al acabar, pase lo que pase:
+        # si no, un F12 durante un 'mantener w 30' deja la W enganchada y el
+        # personaje sigue andando solo
+        self._teclas = set()
+        self._botones = set()
 
     # ---------- análisis ----------
     @classmethod
@@ -1322,15 +1359,71 @@ class Script:
                         errores.append(f"línea {nlin}: '{args[0]}' no es un "
                                        f"número de segundos")
 
-            elif op == "tecla":
+            elif op in ("tecla", "pulsar"):
+                p["op"] = "tecla"
                 if len(args) != 1:
-                    errores.append(f"línea {nlin}: 'tecla' necesita una tecla")
+                    errores.append(f"línea {nlin}: '{op}' necesita una tecla")
                 else:
                     try:
                         resolver_tecla(args[0])
                         p["tecla"] = args[0]
                     except ValueError as exc:
                         errores.append(f"línea {nlin}: {exc}")
+
+            elif op == "girar":
+                if len(args) != 2:
+                    errores.append(f"línea {nlin}: 'girar' necesita dos "
+                                   f"números: cuánto a los lados y cuánto "
+                                   f"arriba o abajo (por ejemplo: girar 200 0)")
+                else:
+                    try:
+                        p["dx"] = int(float(args[0].replace(",", ".")))
+                        p["dy"] = int(float(args[1].replace(",", ".")))
+                    except ValueError:
+                        errores.append(f"línea {nlin}: '{args[0]} {args[1]}' no "
+                                       f"son dos números")
+
+            elif op in ("mantener", "soltar"):
+                if not args:
+                    errores.append(f"línea {nlin}: '{op}' necesita una tecla")
+                else:
+                    try:
+                        resolver_tecla(args[0])
+                        p["tecla"] = args[0]
+                    except ValueError as exc:
+                        errores.append(f"línea {nlin}: {exc}")
+                    p["segundos"] = None
+                    if op == "mantener" and len(args) > 1:
+                        try:
+                            p["segundos"] = float(args[1].replace(",", "."))
+                            if p["segundos"] < 0:
+                                raise ValueError
+                        except ValueError:
+                            errores.append(f"línea {nlin}: '{args[1]}' no es un "
+                                           f"número de segundos")
+                    elif op == "soltar" and len(args) > 1:
+                        errores.append(f"línea {nlin}: 'soltar' solo lleva la "
+                                       f"tecla")
+
+            elif op in ("mantener_clic", "soltar_clic"):
+                p["boton"] = "left"
+                p["segundos"] = None
+                resto = list(args)
+                if resto and resto[0].lower() in ("izquierdo", "derecho",
+                                                  "medio"):
+                    p["boton"] = {"izquierdo": "left", "derecho": "right",
+                                  "medio": "middle"}[resto.pop(0).lower()]
+                if resto and op == "mantener_clic":
+                    try:
+                        p["segundos"] = float(resto.pop(0).replace(",", "."))
+                        if p["segundos"] < 0:
+                            raise ValueError
+                    except ValueError:
+                        errores.append(f"línea {nlin}: en '{op}', tras el botón "
+                                       f"solo van los segundos")
+                if resto:
+                    errores.append(f"línea {nlin}: no entiendo "
+                                   f"'{' '.join(resto)}' en '{op}'")
 
             elif op == "macro":
                 if len(args) != 1:
@@ -1352,7 +1445,17 @@ class Script:
                 else:
                     p["destino"] = int(args[0])
 
-            elif op in ("repetir", "parar", "pitar"):
+            elif op == "repetir":
+                p["veces"] = None       # sin número: para siempre
+                if args:
+                    if len(args) > 1 or not args[0].isdigit() or args[0] == "0":
+                        errores.append(f"línea {nlin}: tras 'repetir' solo va "
+                                       f"un número de veces (o nada, para "
+                                       f"repetir sin parar)")
+                    else:
+                        p["veces"] = int(args[0])
+
+            elif op in ("parar", "pitar"):
                 if args:
                     errores.append(f"línea {nlin}: '{op}' no lleva nada detrás")
 
@@ -1361,6 +1464,10 @@ class Script:
                                f"'{op}'")
                 continue
 
+            # ¿este paso hace perder tiempo? Es lo que frena un bucle
+            p["bloquea"] = (op in ("buscar", "desaparecer", "esperar", "macro")
+                            or (op in ("mantener", "mantener_clic")
+                                and p.get("segundos")))
             pasos.append(p)
 
         if not pasos and not errores:
@@ -1390,10 +1497,10 @@ class Script:
                 break
 
         # un bucle sin nada que espere se comería la CPU y clicaría sin parar
-        hay_bucle = any(p["op"] == "repetir" or
+        hay_bucle = any((p["op"] == "repetir" and p.get("veces") is None) or
                         (p["op"] == "ir" and p.get("destino", 99) <= i)
                         for i, p in enumerate(pasos, 1))
-        if hay_bucle and not any(p["op"] in cls.BLOQUEANTES for p in pasos):
+        if hay_bucle and not any(p.get("bloquea") for p in pasos):
             errores.append("el guion se repite pero no espera nada: añade un "
                            "'buscar' o un 'esperar' o se disparará sin freno")
         return pasos, errores
@@ -1424,6 +1531,28 @@ class Script:
                 txt = f"espera {p['segundos']:g} s"
             elif op == "tecla":
                 txt = f"pulsa la tecla {p['tecla']}"
+            elif op == "girar":
+                lados = ("nada" if not p["dx"] else
+                         f"{abs(p['dx'])} a la {'derecha' if p['dx'] > 0 else 'izquierda'}")
+                vert = ("nada" if not p["dy"] else
+                        f"{abs(p['dy'])} {'abajo' if p['dy'] > 0 else 'arriba'}")
+                txt = f"gira la cámara: {lados}, {vert}"
+            elif op == "mantener":
+                txt = (f"mantiene {p['tecla']} pulsada {p['segundos']:g} s"
+                       if p["segundos"] else
+                       f"deja {p['tecla']} pulsada (hasta un 'soltar')")
+            elif op == "soltar":
+                txt = f"suelta {p['tecla']}"
+            elif op == "mantener_clic":
+                b = {"left": "izquierdo", "right": "derecho",
+                     "middle": "central"}[p["boton"]]
+                txt = (f"mantiene el clic {b} {p['segundos']:g} s"
+                       if p["segundos"] else
+                       f"deja el clic {b} pulsado (hasta un 'soltar_clic')")
+            elif op == "soltar_clic":
+                b = {"left": "izquierdo", "right": "derecho",
+                     "middle": "central"}[p["boton"]]
+                txt = f"suelta el clic {b}"
             elif op == "escribir":
                 txt = f"escribe «{p['texto']}»"
             elif op == "macro":
@@ -1433,7 +1562,8 @@ class Script:
             elif op == "ir":
                 txt = f"salta al paso {p['destino']}"
             elif op == "repetir":
-                txt = "vuelve al paso 1"
+                txt = ("vuelve al paso 1" if p.get("veces") is None
+                       else f"vuelve al paso 1, hasta {p['veces']} veces")
             else:
                 txt = "para"
             out.append(f"{i}. {txt}")
@@ -1464,6 +1594,25 @@ class Script:
     def _esperar(self, seg):
         """Como sleep, pero se corta al parar."""
         return not self._stop.wait(max(0.0, seg))
+
+    def _soltar_todo(self):
+        """Suelta cualquier tecla o botón que quedara pulsado."""
+        sueltos = []
+        for nombre in list(self._teclas):
+            try:
+                self.keyboard.release(resolver_tecla(nombre))
+                sueltos.append(nombre)
+            except Exception:
+                pass
+        self._teclas.clear()
+        for b in list(self._botones):
+            try:
+                self.mouse.release(getattr(Button, b))
+                sueltos.append(f"clic {b}")
+            except Exception:
+                pass
+        self._botones.clear()
+        return sueltos
 
     def _buscar(self, paso, quiero_verlo):
         """Espera a que el objetivo aparezca (o desaparezca). Devuelve
@@ -1501,6 +1650,7 @@ class Script:
 
     def _run(self):
         i = 0
+        vueltas = {}          # paso de 'repetir' -> vueltas dadas
         try:
             while not self._stop.is_set() and 0 <= i < len(self.steps):
                 paso = self.steps[i]
@@ -1562,6 +1712,60 @@ class Script:
                     self.log(f"{n}. tecla {paso['tecla']}")
                     i += 1
 
+                elif op == "girar":
+                    hx, hy = turn_camera(paso["dx"], paso["dy"],
+                                         espera=self._esperar)
+                    self.log(f"{n}. girada la cámara ({hx:+d}, {hy:+d})")
+                    if self._stop.is_set():
+                        break
+                    i += 1
+
+                elif op == "mantener":
+                    k = resolver_tecla(paso["tecla"])
+                    self.keyboard.press(k)
+                    self._teclas.add(paso["tecla"])
+                    if paso["segundos"]:
+                        self.log(f"{n}. {paso['tecla']} pulsada "
+                                 f"{paso['segundos']:g} s")
+                        cortado = not self._esperar(paso["segundos"])
+                        self.keyboard.release(k)
+                        self._teclas.discard(paso["tecla"])
+                        if cortado:
+                            break
+                    else:
+                        self.log(f"{n}. {paso['tecla']} pulsada, la dejo así")
+                    i += 1
+
+                elif op == "soltar":
+                    k = resolver_tecla(paso["tecla"])
+                    self.keyboard.release(k)
+                    self._teclas.discard(paso["tecla"])
+                    self.log(f"{n}. soltada {paso['tecla']}")
+                    i += 1
+
+                elif op == "mantener_clic":
+                    btn = getattr(Button, paso["boton"])
+                    self.mouse.press(btn)
+                    self._botones.add(paso["boton"])
+                    if paso["segundos"]:
+                        self.log(f"{n}. clic {paso['boton']} mantenido "
+                                 f"{paso['segundos']:g} s")
+                        cortado = not self._esperar(paso["segundos"])
+                        self.mouse.release(btn)
+                        self._botones.discard(paso["boton"])
+                        if cortado:
+                            break
+                    else:
+                        self.log(f"{n}. clic {paso['boton']} pulsado, lo dejo "
+                                 f"así")
+                    i += 1
+
+                elif op == "soltar_clic":
+                    self.mouse.release(getattr(Button, paso["boton"]))
+                    self._botones.discard(paso["boton"])
+                    self.log(f"{n}. soltado el clic {paso['boton']}")
+                    i += 1
+
                 elif op == "escribir":
                     # con la misma cadencia que el texto programado: de golpe,
                     # un juego se salta letras
@@ -1589,7 +1793,18 @@ class Script:
                     i = paso["destino"] - 1
 
                 elif op == "repetir":
-                    i = 0
+                    if paso.get("veces") is None:
+                        i = 0
+                    else:
+                        hechas = vueltas.get(i, 0) + 1
+                        vueltas[i] = hechas
+                        if hechas <= paso["veces"]:
+                            self.log(f"{n}. vuelta {hechas} de "
+                                     f"{paso['veces']}")
+                            i = 0
+                        else:
+                            self.log(f"{n}. hechas las {paso['veces']} vueltas.")
+                            break
 
                 else:                      # parar
                     self.log(f"{n}. parar")
@@ -1598,6 +1813,10 @@ class Script:
         except Exception as exc:
             self.log(f"El guion se ha cortado por un error: {exc}")
         finally:
+            sueltos = self._soltar_todo()
+            if sueltos:
+                self.log("Suelto lo que quedaba pulsado: "
+                         + ", ".join(sueltos) + ".")
             self.running = False
             self._stop.set()
             if self.on_finish:
@@ -2115,9 +2334,18 @@ class App:
                   "   escribir <texto>",
                   "   macro <archivo.macro.json>",
                   "   pitar",
-                  "   ir <nº> / repetir / parar",
+                  "   ir <nº> / repetir [veces] / parar",
+                  "Para juegos en 1ª persona:",
+                  "   girar <lados> <arriba/abajo>  ← girar 200 0 mira a la "
+                  "derecha; negativo, al revés",
+                  "   mantener <tecla> [segundos]   ← sin segundos, hasta un "
+                  "'soltar'",
+                  "   soltar <tecla>",
+                  "   mantener_clic [derecho] [segundos]  ← para picar, minar…",
+                  "   soltar_clic [derecho]",
                   "Sin segundos, 'buscar' espera indefinidamente. Los números "
-                  "de paso son los que muestra 'Comprobar'."):
+                  "de paso son los que muestra 'Comprobar'. Al parar el guion se "
+                  "suelta solo todo lo que hubiera quedado pulsado."):
             self.log(l)
 
     def script_example(self):

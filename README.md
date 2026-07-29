@@ -314,7 +314,36 @@ Una por línea. Todo lo que vaya tras `#` es un comentario.
 | `escribir <texto>` | Teclea el texto tal cual. |
 | `macro <archivo.macro.json>` | Reproduce una macro grabada y espera a que acabe. |
 | `pitar` | Un pitido, para saber por dónde va sin mirar. |
-| `ir <nº>` / `repetir` / `parar` | Salta a un paso, vuelve al 1, o termina. |
+| `ir <nº>` / `repetir [veces]` / `parar` | Salta a un paso, vuelve al 1 (sin número, sin parar), o termina. |
+
+Y para juegos en primera persona:
+
+| Instrucción | Qué hace |
+|---|---|
+| `girar <lados> <arriba/abajo>` | Gira la cámara. `girar 200 0` mira a la derecha; en negativo, al contrario. |
+| `mantener <tecla> [segundos]` | Deja una tecla pulsada. Sin segundos, hasta un `soltar`. |
+| `soltar <tecla>` | La suelta. |
+| `mantener_clic [derecho] [segundos]` | Deja el botón pulsado: picar, minar, disparar. |
+| `soltar_clic [derecho]` | Lo suelta. |
+
+`girar` no manda el desplazamiento de un salto: lo reparte en trozos pequeños,
+como lo haría un ratón de verdad, porque muchos juegos limitan cuánto puede girar
+la vista en un fotograma y el resto se perdería. El total sumado es exactamente
+el pedido — los restos del redondeo se arrastran en vez de perderse.
+
+**Al parar el guion se suelta solo todo lo que hubiera quedado pulsado**, tanto si
+lo paras tú con F10 o F12 como si se corta por un error. Sin eso, un F12 en medio
+de un `mantener w 30` te dejaría la W enganchada y el personaje andando solo.
+
+Un ejemplo de picar mirando al frente y volver:
+
+```
+mantener_clic 5
+girar 180 0
+mantener w 2
+girar -180 0
+repetir 10
+```
 
 En `si_falla` puedes poner `parar` (lo que hace por defecto), `seguir`, `repetir`
 o `ir <nº>`. Solo tiene sentido con un límite de segundos: sin él la búsqueda no
