@@ -55,6 +55,34 @@ ratón (unas 125 muestras por segundo), clics, arrastres, rueda y teclado. La
 reproducción respeta la cadencia original y admite velocidad (0.5x – 4x) y
 repeticiones (0 = bucle infinito).
 
+### Movimiento relativo (juegos en 1ª persona)
+
+En un juego que captura el ratón —Minecraft en primera persona, o cualquier
+FPS— el cursor del sistema **no se mueve**. El juego pide *raw input* y lee
+cuánto se ha desplazado el ratón, no dónde está el puntero. Por eso una macro
+normal, que guarda posiciones y las restaura, no gira la cámara.
+
+Marca **Movimiento relativo** antes de grabar y Golem cambia las dos mitades:
+
+- **al grabar**, se registra como receptor de raw input y guarda el
+  desplazamiento (`dx`, `dy`) de cada informe del ratón, sin agruparlos ni
+  filtrarlos;
+- **al reproducir**, los inyecta con `SendInput` en modo relativo, que es lo
+  único que llega al juego.
+
+Lo que se graba es lo que se reproduce, número por número: la prueba de ida y
+vuelta comprueba que la secuencia de deltas sale idéntica a la que entró. Y va
+por debajo de la aceleración del puntero de Windows, así que el juego recibe los
+valores crudos del ratón — sin deformar. (En el escritorio verás el cursor
+moverse más de la cuenta, porque ahí sí se aplica la aceleración; al juego le
+llega exacto.)
+
+En este modo un clic **no** recoloca el cursor: en primera persona el clic va
+donde apunta la mira, y moverlo rompería la cámara.
+
+No hay que marcar nada para reproducir. El modo se deduce del contenido de la
+macro, así que las macros que ya tuvieras siguen funcionando igual que antes.
+
 Si cortas la reproducción a mitad, el programa suelta automáticamente cualquier
 tecla o botón que hubiera quedado pulsado. Eso es lo que evita quedarte con el
 Shift o el clic izquierdo "enganchados".

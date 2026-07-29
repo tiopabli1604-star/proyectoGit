@@ -27,6 +27,7 @@ import math
 import os
 import sys
 import tempfile
+from ctypes import wintypes
 import threading
 import time
 import tkinter as tk
@@ -162,6 +163,254 @@ def precise_sleep_until(t_target, t0):
             time.sleep(0)  # spin suave
 
 
+# ------------------------------------- movimiento relativo (juegos en 1ª persona)
+#
+# En un juego que captura el ratón (Minecraft en primera persona) el cursor del
+# sistema no se mueve: el juego pide "raw input" y lee los desplazamientos que
+# manda el ratón, no dónde está el puntero. Por eso mover el cursor con
+# SetCursorPos —lo que hace pynput— no gira la cámara. Hay que hacer las dos
+# mitades con la API de Windows:
+#
+#   · grabar: registrarse como receptor de raw input y quedarse con los deltas
+#     (lLastX / lLastY) de cada informe del ratón;
+#   · reproducir: SendInput con MOUSEEVENTF_MOVE *sin* MOUSEEVENTF_ABSOLUTE, que
+#     inyecta un desplazamiento relativo y sí llega al juego.
+
+_user32 = ctypes.windll.user32
+
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000
+RIDEV_INPUTSINK = 0x00000100
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+MOUSE_MOVE_ABSOLUTE = 0x01
+WM_INPUT = 0x00FF
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+HWND_MESSAGE = -3
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _INPUT_U(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_U)]
+
+
+def move_relative(dx, dy):
+    """Inyecta un desplazamiento relativo del ratón. Devuelve True si entró.
+
+    Es lo único que entiende un juego en primera persona con el ratón preso.
+    NOCOALESCE evita que Windows junte varios movimientos seguidos en uno, que
+    es justo lo que arruinaría la precisión al reproducir rápido.
+    """
+    dx, dy = int(dx), int(dy)
+    if dx == 0 and dy == 0:
+        return True
+    inp = _INPUT(type=INPUT_MOUSE)
+    inp.mi = _MOUSEINPUT(dx=dx, dy=dy, mouseData=0,
+                         dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                         time=0, dwExtraInfo=None)
+    return _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 1
+
+
+class _RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
+                ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND)]
+
+
+class _RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD),
+                ("hDevice", wintypes.HANDLE), ("wParam", wintypes.WPARAM)]
+
+
+class _RAWMOUSE_BTN(ctypes.Structure):
+    _fields_ = [("usButtonFlags", wintypes.USHORT),
+                ("usButtonData", wintypes.USHORT)]
+
+
+class _RAWMOUSE_U(ctypes.Union):
+    _fields_ = [("ulButtons", wintypes.ULONG), ("btn", _RAWMOUSE_BTN)]
+
+
+class _RAWMOUSE(ctypes.Structure):
+    _fields_ = [("usFlags", wintypes.USHORT), ("u", _RAWMOUSE_U),
+                ("ulRawButtons", wintypes.ULONG),
+                ("lLastX", wintypes.LONG), ("lLastY", wintypes.LONG),
+                ("ulExtraInformation", wintypes.ULONG)]
+
+
+class _RAWINPUT(ctypes.Structure):
+    _fields_ = [("header", _RAWINPUTHEADER), ("mouse", _RAWMOUSE)]
+
+
+# LRESULT es LONG_PTR: del tamaño de un puntero, no siempre 32 bits
+_LRESULT = ctypes.c_ssize_t
+_WNDPROC = ctypes.WINFUNCTYPE(_LRESULT, wintypes.HWND, wintypes.UINT,
+                              wintypes.WPARAM, wintypes.LPARAM)
+_user32.DefWindowProcW.restype = _LRESULT
+_user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+_user32.SendInput.restype = wintypes.UINT
+_user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
+_user32.CreateWindowExW.restype = wintypes.HWND
+_user32.GetRawInputData.restype = wintypes.UINT
+
+
+class _WNDCLASS(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", _WNDPROC),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR)]
+
+
+_RAW_CLASE = "GolemRawMouse"
+_raw_oyentes = {}            # hwnd -> RawMouseListener
+_raw_clase_lista = False
+_raw_lock = threading.Lock()
+
+
+def _raw_wndproc(hwnd, msg, wparam, lparam):
+    """Único WNDPROC del proceso; reparte por hwnd.
+
+    La clase de ventana se registra una sola vez y se queda con el puntero al
+    WNDPROC para siempre. Si ese puntero fuera un método de una instancia, en
+    cuanto la instancia se recogiera Windows saltaría a memoria liberada
+    (access violation al despachar WM_INPUT). Por eso el WNDPROC vive en el
+    módulo y la instancia se busca en un diccionario.
+    """
+    if msg == WM_INPUT:
+        oyente = _raw_oyentes.get(int(hwnd) if hwnd else 0)
+        if oyente is not None:
+            oyente._procesar(lparam)
+    elif msg == WM_CLOSE:
+        _user32.DestroyWindow(hwnd)
+        return 0
+    elif msg == WM_DESTROY:
+        # saca del bucle GetMessage al hilo que está despachando, que es el del
+        # propio oyente. Sin esto habría que confiar en que GetMessage devuelva
+        # -1 al quedarse la ventana inválida, que es mucho más frágil.
+        _user32.PostQuitMessage(0)
+        return 0
+    return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+_RAW_WNDPROC = _WNDPROC(_raw_wndproc)   # referencia viva mientras corra el proceso
+
+
+class RawMouseListener:
+    """Escucha los desplazamientos crudos del ratón, los mire quien los mire.
+
+    Crea una ventana sin interfaz (HWND_MESSAGE) y se registra con
+    RIDEV_INPUTSINK, que es lo que permite seguir recibiendo los informes del
+    ratón aunque la ventana activa sea el juego. Cada informe trae el delta que
+    ha mandado el ratón, que es exactamente lo que hay que guardar.
+    """
+
+    def __init__(self, on_move):
+        self.on_move = on_move
+        self._hwnd = None
+        self._thread = None
+        self._listo = threading.Event()
+        self.error = None
+
+    def _procesar(self, lparam):
+        tam = wintypes.UINT(ctypes.sizeof(_RAWINPUT))
+        datos = _RAWINPUT()
+        leidos = _user32.GetRawInputData(
+            wintypes.HANDLE(lparam), RID_INPUT, ctypes.byref(datos),
+            ctypes.byref(tam), ctypes.sizeof(_RAWINPUTHEADER))
+        if leidos <= 0 or datos.header.dwType != RIM_TYPEMOUSE:
+            return
+        m = datos.mouse
+        # los ratones normales informan en relativo; un digitalizador o un
+        # escritorio remoto puede informar en absoluto, y entonces lLastX y
+        # lLastY no son deltas y no sirven
+        if (m.usFlags & MOUSE_MOVE_ABSOLUTE) or not (m.lLastX or m.lLastY):
+            return
+        try:
+            self.on_move(m.lLastX, m.lLastY)
+        except Exception:
+            pass
+
+    def _run(self):
+        global _raw_clase_lista
+        try:
+            hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+            with _raw_lock:
+                if not _raw_clase_lista:
+                    wc = _WNDCLASS()
+                    wc.lpfnWndProc = _RAW_WNDPROC
+                    wc.hInstance = hinst
+                    wc.lpszClassName = _RAW_CLASE
+                    if not _user32.RegisterClassW(ctypes.byref(wc)):
+                        raise OSError("no pude registrar la clase de ventana")
+                    _raw_clase_lista = True
+            hwnd = _user32.CreateWindowExW(
+                0, _RAW_CLASE, _RAW_CLASE, 0, 0, 0, 0, 0,
+                wintypes.HWND(HWND_MESSAGE), None, hinst, None)
+            if not hwnd:
+                raise OSError("no pude crear la ventana de mensajes")
+            # apuntarse ANTES de registrar el raw input, para no perder el
+            # primer informe que llegue
+            _raw_oyentes[int(hwnd)] = self
+            self._hwnd = hwnd
+            rid = _RAWINPUTDEVICE(usUsagePage=0x01, usUsage=0x02,
+                                  dwFlags=RIDEV_INPUTSINK,
+                                  hwndTarget=hwnd)
+            if not _user32.RegisterRawInputDevices(
+                    ctypes.byref(rid), 1, ctypes.sizeof(_RAWINPUTDEVICE)):
+                raise OSError("no pude registrarme para recibir raw input")
+        except Exception as exc:
+            self.error = exc
+            if self._hwnd:
+                _raw_oyentes.pop(int(self._hwnd), None)
+                _user32.DestroyWindow(wintypes.HWND(self._hwnd))
+                self._hwnd = None
+            self._listo.set()
+            return
+        self._listo.set()
+        msg = wintypes.MSG()
+        # hwnd nulo: todos los mensajes de este hilo, y así WM_QUIT (que no va
+        # dirigido a una ventana) también corta el bucle
+        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            _user32.TranslateMessage(ctypes.byref(msg))
+            _user32.DispatchMessageW(ctypes.byref(msg))
+        _raw_oyentes.pop(int(hwnd), None)
+
+    def start(self, timeout=2.0):
+        """Arranca y espera a saber si se pudo registrar. True si va."""
+        self._listo.clear()
+        self.error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._listo.wait(timeout)
+        return self.error is None and self._hwnd is not None
+
+    def stop(self):
+        hwnd = self._hwnd
+        if not hwnd:
+            return
+        self._hwnd = None
+        _raw_oyentes.pop(int(hwnd), None)
+        # el bucle de mensajes vive en el otro hilo; se le saca con un WM_CLOSE
+        _user32.PostMessageW(wintypes.HWND(hwnd), WM_CLOSE, 0, 0)
+        if self._thread:
+            self._thread.join(timeout=1.5)
+
+
 def click_at(mouse, x, y, boton="left", doble=False, restore=True,
              move_delay=0.20):
     """Mueve, clica y (si se pide) devuelve el ratón donde estaba.
@@ -200,17 +449,32 @@ def beep(ok=True):
 # ---------------------------------------------------------------- grabador
 
 class Recorder:
-    """Graba eventos globales de ratón y teclado con marca de tiempo."""
+    """Graba eventos globales de ratón y teclado con marca de tiempo.
+
+    Dos formas de guardar el movimiento del ratón:
+
+      · **absoluta** ('mm', x/y): dónde estaba el puntero. Es lo que vale para
+        menús, escritorio y ventanas normales.
+      · **relativa** ('mr', dx/dy): cuánto se ha desplazado el ratón, leído por
+        raw input. Es la única que sirve en un juego en primera persona con el
+        ratón preso, donde el cursor no se mueve y el juego solo mira los
+        desplazamientos. Y se graba tal cual llega del ratón, sin pasar por la
+        aceleración del puntero de Windows, así que al reproducirlo el juego
+        recibe exactamente los mismos números.
+    """
 
     MOVE_MIN_INTERVAL = 0.008  # ~125 muestras/s de movimiento: fluido y ligero
 
     def __init__(self):
         self.events = []
         self.recording = False
+        self.relative = False       # modo para juegos en primera persona
+        self.raw_error = None
         self._t0 = 0.0
         self._last_move_t = 0.0
         self._m_listener = None
         self._k_listener = None
+        self._raw = None
         self.lock = threading.Lock()
 
     def start(self):
@@ -219,6 +483,15 @@ class Recorder:
             self._t0 = time.perf_counter()
             self._last_move_t = -1.0
             self.recording = True
+        self.raw_error = None
+        self._raw = None
+        if self.relative:
+            self._raw = RawMouseListener(self._on_raw_move)
+            if not self._raw.start():
+                self.raw_error = self._raw.error or "motivo desconocido"
+                self._raw = None
+        # en modo relativo se sigue escuchando a pynput para clics, rueda y
+        # teclado; solo el movimiento viene por raw input
         self._m_listener = mouse.Listener(
             on_move=self._on_move, on_click=self._on_click,
             on_scroll=self._on_scroll)
@@ -229,6 +502,9 @@ class Recorder:
 
     def stop(self):
         self.recording = False
+        if self._raw:
+            self._raw.stop()
+            self._raw = None
         if self._m_listener:
             self._m_listener.stop()
             self._m_listener = None
@@ -240,8 +516,15 @@ class Recorder:
     def _now(self):
         return time.perf_counter() - self._t0
 
-    def _on_move(self, x, y):
+    def _on_raw_move(self, dx, dy):
+        """Un informe del ratón: se guarda el delta sin tocar ni agrupar."""
         if not self.recording:
+            return
+        self.events.append({"t": self._now(), "e": "mr", "dx": int(dx),
+                            "dy": int(dy)})
+
+    def _on_move(self, x, y):
+        if not self.recording or self.relative:
             return
         t = self._now()
         if t - self._last_move_t < self.MOVE_MIN_INTERVAL:
@@ -281,13 +564,24 @@ class Player:
         self.mouse = MouseController()
         self.keyboard = KeyboardController()
         self.playing = False
+        self.relative = False
         self._thread = None
         self.on_finish = on_finish
         self.on_progress = on_progress
 
+    @staticmethod
+    def es_relativa(events):
+        """¿Esta macro guarda el movimiento en relativo?
+
+        Se deduce de los propios eventos en vez de fiarse de una bandera del
+        archivo, para que una macro vieja siga funcionando igual.
+        """
+        return any(ev.get("e") == "mr" for ev in events)
+
     def play(self, events, speed=1.0, repeats=1):
         if self.playing or not events:
             return
+        self.relative = self.es_relativa(events)
         self.playing = True
         self._thread = threading.Thread(
             target=self._run, args=(events, speed, repeats), daemon=True)
@@ -304,6 +598,7 @@ class Player:
         """
         if not events:
             return
+        self.relative = self.es_relativa(events)
         self.playing = True
         self._run(events, speed, repeats)
 
@@ -330,17 +625,25 @@ class Player:
 
     def _exec(self, ev):
         e = ev["e"]
-        if e == "mm":
+        if e == "mr":
+            # desplazamiento relativo: lo único que entiende un juego en
+            # primera persona con el ratón preso
+            move_relative(ev["dx"], ev["dy"])
+        elif e == "mm":
             self.mouse.position = (ev["x"], ev["y"])
         elif e == "mc":
-            self.mouse.position = (ev["x"], ev["y"])
+            # en una macro relativa el cursor del sistema no pinta nada: el
+            # clic va donde apunte la mira, y recolocarlo rompería la cámara
+            if not self.relative:
+                self.mouse.position = (ev["x"], ev["y"])
             btn = getattr(Button, ev["b"])
             if ev["d"]:
                 self.mouse.press(btn)
             else:
                 self.mouse.release(btn)
         elif e == "ms":
-            self.mouse.position = (ev["x"], ev["y"])
+            if not self.relative:
+                self.mouse.position = (ev["x"], ev["y"])
             self.mouse.scroll(ev["dx"], ev["dy"])
         elif e == "kd":
             self.keyboard.press(str_to_key(ev["k"]))
@@ -801,6 +1104,12 @@ class Watcher:
             self.log(f"Clic en ({x}, {y}) — {det}{extra}  "
                      f"[total: {self.clicks_done}]"
                      + (f"  captura: {shot}" if shot else ""))
+            if len(found) > 1:
+                # saber quién competía es lo que dice si la zona está holgada
+                otros = ", ".join(f"({c[0]}, {c[1]}) {c[2]} px²"
+                                  for c in found[1:4])
+                self.log(f"   competían: {otros}. Si alguno de esos es el "
+                         f"bueno, aprieta la zona con F2.")
             if self.sound:
                 beep(True)
 
@@ -1353,6 +1662,15 @@ class App:
                     width=6).pack(side="left", padx=4)
         ttk.Label(row3, text="minutos").pack(side="left")
 
+        row4 = ttk.Frame(fm)
+        row4.pack(fill="x", **pad)
+        self.var_relative = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4,
+                        text="Movimiento relativo (juegos en 1ª persona: "
+                             "Minecraft, FPS…)",
+                        variable=self.var_relative,
+                        command=self._on_relative_change).pack(side="left")
+
         self.lbl_macro = ttk.Label(fm, text="Sin macro cargada")
         self.lbl_macro.pack(anchor="w", **pad)
 
@@ -1619,6 +1937,21 @@ class App:
                                      else "no había nada activo") + ".")
         beep(False)
 
+    # ---------- movimiento relativo ----------
+    def _on_relative_change(self):
+        self.recorder.relative = self.var_relative.get()
+        if self.recorder.relative:
+            self.log("Movimiento relativo ACTIVADO para grabar. Guardaré cuánto "
+                     "se desplaza el ratón en vez de dónde está el puntero, "
+                     "leyéndolo del propio ratón por raw input. Es lo único que "
+                     "gira la cámara en un juego que captura el ratón.")
+            self.log("   Al reproducir se detecta solo por el contenido de la "
+                     "macro, así que no tienes que volver a marcar nada.")
+        else:
+            self.log("Movimiento relativo desactivado: vuelvo a grabar "
+                     "posiciones absolutas, que es lo que vale para menús y "
+                     "ventanas normales.")
+
     # ---------- guion ----------
     def _refresh_targets(self):
         nombres = sorted(self.targets)
@@ -1863,21 +2196,42 @@ class App:
             return
         if not self.recorder.recording:
             self.watcher.paused = True
+            self.recorder.relative = self.var_relative.get()
             self.recorder.start()
             self.btn_rec.configure(text="■ Parar grabación (F6)")
             self.set_status("GRABANDO…  (F6 para parar)")
-            self.log("Grabación iniciada.")
+            modo = ("movimiento relativo, para juegos en 1ª persona"
+                    if self.recorder.relative else "posiciones absolutas")
+            self.log(f"Grabación iniciada ({modo}).")
+            if self.recorder.raw_error:
+                self.log(f"   Pero no pude leer el ratón por raw input "
+                         f"({self.recorder.raw_error}), así que no se grabará "
+                         f"el movimiento. Los clics y el teclado sí.")
+                beep(False)
         else:
             self.events = self.recorder.stop()
             self.watcher.paused = False
             self.btn_rec.configure(text="● Grabar (F6)")
             dur = self.events[-1]["t"] if self.events else 0
+            rel = Player.es_relativa(self.events)
+            movs = sum(1 for e in self.events if e["e"] in ("mm", "mr"))
             self.lbl_macro.configure(
                 text=f"Macro grabada: {len(self.events)} eventos, "
-                     f"{dur:.1f} s (sin guardar)")
+                     f"{dur:.1f} s{' , relativa' if rel else ''} (sin guardar)")
             self.set_status("Inactivo")
-            self.log(f"Grabación parada: {len(self.events)} eventos, "
-                     f"{dur:.1f} s.")
+            self.log(f"Grabación parada: {len(self.events)} eventos "
+                     f"({movs} de movimiento), {dur:.1f} s"
+                     + (", en relativo." if rel else "."))
+            if rel:
+                total_x = sum(e["dx"] for e in self.events if e["e"] == "mr")
+                total_y = sum(e["dy"] for e in self.events if e["e"] == "mr")
+                self.log(f"   Desplazamiento total del ratón: {total_x:+d} en "
+                         f"horizontal, {total_y:+d} en vertical. Al reproducir "
+                         f"se inyectan esos mismos números, uno por uno.")
+            elif self.recorder.relative and not movs:
+                self.log("   No se ha grabado ningún movimiento: si estabas en "
+                         "un juego con el ratón preso, comprueba que el aviso "
+                         "de raw input no salió al empezar.")
 
     def toggle_play(self):
         if self.recorder.recording:
@@ -1953,12 +2307,17 @@ class App:
             filetypes=[("Macro", "*.macro.json"), ("JSON", "*.json")])
         if not path:
             return
+        rel = Player.es_relativa(self.events)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"version": 1, "events": self.events}, f)
+            # 'relative' es informativo: al cargar se deduce de los eventos, así
+            # que una macro de la versión 1 sigue reproduciéndose igual
+            json.dump({"version": 2, "relative": rel,
+                       "events": self.events}, f)
         self.current_file = path
         self.lbl_macro.configure(
-            text=f"Macro: {os.path.basename(path)} ({len(self.events)} eventos)")
-        self.log(f"Guardada en {path}")
+            text=f"Macro: {os.path.basename(path)} ({len(self.events)} eventos"
+                 f"{', relativa' if rel else ''})")
+        self.log(f"Guardada en {path}" + (" (movimiento relativo)" if rel else ""))
 
     def load_macro(self):
         path = filedialog.askopenfilename(
@@ -1967,7 +2326,7 @@ class App:
         if not path:
             return
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
             self.events = data["events"]
         except Exception as exc:
@@ -1975,10 +2334,17 @@ class App:
             return
         self.current_file = path
         dur = self.events[-1]["t"] if self.events else 0
+        rel = Player.es_relativa(self.events)
         self.lbl_macro.configure(
             text=f"Macro: {os.path.basename(path)} "
-                 f"({len(self.events)} eventos, {dur:.1f} s)")
-        self.log(f"Cargada {os.path.basename(path)}")
+                 f"({len(self.events)} eventos, {dur:.1f} s"
+                 f"{', relativa' if rel else ''})")
+        self.log(f"Cargada {os.path.basename(path)}"
+                 + (" — lleva movimiento relativo, así que se reproducirá para "
+                    "un juego en 1ª persona." if rel else ""))
+        # la casilla sigue al contenido, para que no engañe
+        self.var_relative.set(rel)
+        self.recorder.relative = rel
 
     # ---------- vigilante ----------
     def toggle_watch(self):
@@ -2152,6 +2518,8 @@ class App:
         self.var_shots.set(cfg.get("shots", True))
         self.var_topmost.set(cfg.get("topmost", False))
         self.var_logfile.set(cfg.get("logfile", True))
+        self.var_relative.set(cfg.get("relative", False))
+        self.recorder.relative = self.var_relative.get()
         guardados = cfg.get("targets")
         if isinstance(guardados, dict):
             self.targets.clear()          # el Script comparte este mismo dict
@@ -2175,6 +2543,7 @@ class App:
         cfg["logfile"] = self.var_logfile.get()
         cfg["targets"] = self.targets
         cfg["script"] = self.txt_script.get("1.0", "end").rstrip()
+        cfg["relative"] = self.var_relative.get()
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)

@@ -7,7 +7,7 @@ import sys
 AQUI = os.path.dirname(os.path.abspath(__file__))
 SUITES = ("test_base.py", "test_zona.py", "test_escena_real.py",
           "test_unico.py", "test_migracion.py", "test_guion.py",
-          "test_guion_gui.py", "test_dir_datos.py")
+          "test_guion_gui.py", "test_dir_datos.py", "test_relativo.py")
 
 if __name__ == "__main__":
     fallos = []
