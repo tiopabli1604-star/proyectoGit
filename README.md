@@ -22,6 +22,7 @@ Junto al ejecutable se creará un `macropro_config.json` con tus ajustes.
 |-------|--------|
 | F6    | Empezar / parar grabación |
 | F7    | Reproducir / parar reproducción |
+| F8    | Cuentagotas: capturar el color bajo el ratón y calibrarse solo |
 | F9    | Activar / desactivar Auto-Captcha |
 
 Funcionan aunque la ventana del programa no esté en primer plano.
@@ -47,20 +48,37 @@ fijas: funciona esté donde esté la zona verde.
 Para evitar clics indeseados exige ver la zona en **dos escaneos seguidos**
 antes de actuar, y luego respeta un tiempo de espera (cooldown) configurable.
 
-### Calibración
+### Calibración en dos pasos
 
-Usa el botón **Probar detección ahora**: te da 3 segundos para dejar la
-pantalla como cuando aparece el aviso y luego te dice en el registro si lo
-detecta y en qué coordenadas, **sin hacer clic**.
+**1. Cuentagotas.** Deja en pantalla el objeto que hay que clicar, pon el ratón
+justo encima y pulsa **F8**. El programa lee el color exacto de esos píxeles
+(mediana de un cuadro de 5×5, para no tragarse un borde o una sombra) y ajusta
+solo el tono, la saturación y el brillo con un margen generoso. En el registro
+verás el RGB y el rango que ha fijado.
 
-Si no lo detecta, ajusta:
+Esto es lo que evita adivinar números: un cristal translúcido de Minecraft sale
+con tono ~45 y saturación baja, muy lejos de los valores de un verde puro.
 
-- **Tono verde (0-179)** — en OpenCV el verde puro es 60; los verdes lima suelen
-  caer entre 40 y 70.
-- **± tolerancia** — súbela para aceptar un rango de verdes más amplio.
-- **Saturación mín. / Brillo mín.** — bájalos si el verde es apagado u oscuro.
-- **Área mínima (px²)** — súbela para ignorar verdes pequeños (hierba, iconos) y
-  quedarte solo con la zona grande del aviso.
+**2. Probar detección.** Pulsa **Probar detección (3 s)**, deja la pantalla como
+cuando aparece el aviso y mira el registro: lista todos los candidatos con sus
+coordenadas y su área, **sin hacer clic**. El nº 1 es el que se clicaría.
+
+También guarda un `debug_deteccion.png` junto al ejecutable, con los píxeles
+detectados en rojo y cada candidato recuadrado (verde = aceptado, amarillo =
+descartado por área). El botón **Ver imagen de depuración** lo abre.
+
+### Si detecta el objeto equivocado
+
+Cuando en el registro aparece más de un candidato y el correcto no es el nº 1
+(típico si tu inventario tiene otros objetos del mismo color), acota la búsqueda:
+
+- **Buscar desde / hasta (% alto)** — limita la franja vertical de pantalla que
+  se analiza. Por ejemplo `0` a `65` ignora la mitad inferior, donde suele estar
+  tu propio inventario.
+- **Área mín. / máx. (px²)** — el objeto de una casilla ronda unos cientos de
+  px²; súbele el mínimo para descartar motas de color y bájale el máximo para
+  descartar paredes o fondos grandes del mismo tono.
+- **± tolerancia** — bájala para exigir un color más parecido al capturado.
 
 Los dos modos conviven: el Auto-Captcha se pausa solo mientras grabas o
 reproduces una macro.

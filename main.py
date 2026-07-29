@@ -4,12 +4,13 @@ MacroPro — Grabador/reproductor de macros + Auto-Captcha por color.
 
 Modo 1 (Macro): graba TODOS los eventos de ratón (movimiento, clic, arrastre,
 rueda) y teclado con tiempos exactos, y los reproduce de forma idéntica.
-Modo 2 (Auto-Captcha): vigila la pantalla y cuando aparece una zona verde
-señalizada, hace clic en su centro automáticamente (esté donde esté).
+Modo 2 (Auto-Captcha): vigila la pantalla y cuando aparece la zona del color
+buscado, hace clic en su centro automáticamente.
 
 Hotkeys globales:
   F6 = grabar / parar grabación
   F7 = reproducir / parar reproducción
+  F8 = cuentagotas: capturar el color bajo el ratón y calibrarse solo
   F9 = activar / desactivar Auto-Captcha
 """
 
@@ -47,11 +48,15 @@ from pynput.keyboard import Key, KeyCode, Controller as KeyboardController
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_PATH = os.path.join(APP_DIR, "macropro_config.json")
+DEBUG_IMG = os.path.join(APP_DIR, "debug_deteccion.png")
 
 HOTKEY_RECORD = keyboard.Key.f6
 HOTKEY_PLAY = keyboard.Key.f7
+HOTKEY_PICK = keyboard.Key.f8
 HOTKEY_CAPTCHA = keyboard.Key.f9
-HOTKEYS = {HOTKEY_RECORD, HOTKEY_PLAY, HOTKEY_CAPTCHA}
+HOTKEYS = {HOTKEY_RECORD, HOTKEY_PLAY, HOTKEY_PICK, HOTKEY_CAPTCHA}
+
+SCALE = 0.5  # las capturas se analizan a media resolución (rápido y suficiente)
 
 
 # ---------------------------------------------------------------- utilidades
@@ -249,28 +254,133 @@ class Player:
                 pass
 
 
+# ---------------------------------------------------------------- detector
+
+class ColorFinder:
+    """Busca manchas del color configurado en la pantalla.
+
+    Trabaja a media resolución por velocidad. Soporta que el rango de tono
+    cruce el 0 (rojos) y una banda vertical de búsqueda para ignorar zonas de
+    la pantalla (por ejemplo el inventario propio en un juego).
+    """
+
+    def __init__(self):
+        self.hue = 48        # verde lima; el cuentagotas (F8) lo afina
+        self.hue_tol = 12
+        self.sat_min = 40
+        self.val_min = 90
+        self.min_area = 80      # px² reales
+        self.max_area = 40000   # px² reales; descarta paredes/fondos enormes
+        self.roi_top = 0.0      # fracción de pantalla donde empieza la búsqueda
+        self.roi_bottom = 1.0   # y donde acaba
+
+    # ---- captura ----
+    @staticmethod
+    def grab_screen():
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+            img = np.asarray(sct.grab(mon))
+        return img[:, :, :3], mon  # BGR, monitor
+
+    def build_mask(self, bgr_small):
+        hsv = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2HSV)
+        lo_h = self.hue - self.hue_tol
+        hi_h = self.hue + self.hue_tol
+        if lo_h < 0 or hi_h > 179:
+            # el rango cruza el extremo del círculo de tono: dos tramos
+            a = cv2.inRange(hsv,
+                            np.array([0, self.sat_min, self.val_min]),
+                            np.array([max(0, hi_h % 180), 255, 255]))
+            b = cv2.inRange(hsv,
+                            np.array([lo_h % 180, self.sat_min, self.val_min]),
+                            np.array([179, 255, 255]))
+            mask = cv2.bitwise_or(a, b)
+        else:
+            mask = cv2.inRange(hsv,
+                               np.array([lo_h, self.sat_min, self.val_min]),
+                               np.array([hi_h, 255, 255]))
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+    def candidates(self, save_debug=False):
+        """Devuelve [(x, y, area_real), ...] ordenado por área descendente."""
+        bgr, mon = self.grab_screen()
+        h = bgr.shape[0]
+        y_ini = int(h * max(0.0, min(1.0, self.roi_top)))
+        y_fin = int(h * max(0.0, min(1.0, self.roi_bottom)))
+        if y_fin - y_ini < 10:
+            y_ini, y_fin = 0, h
+        band = bgr[y_ini:y_fin, :]
+
+        small = cv2.resize(band, None, fx=SCALE, fy=SCALE,
+                           interpolation=cv2.INTER_AREA)
+        mask = self.build_mask(small)
+        n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+
+        px_factor = 1.0 / (SCALE * SCALE)  # área reducida -> área real
+        found = []
+        for i in range(1, n):
+            area_real = stats[i, cv2.CC_STAT_AREA] * px_factor
+            if self.min_area <= area_real <= self.max_area:
+                cx, cy = centroids[i]
+                found.append((int(cx / SCALE) + mon["left"],
+                              int(cy / SCALE) + y_ini + mon["top"],
+                              int(area_real)))
+        found.sort(key=lambda c: -c[2])
+
+        if save_debug:
+            vis = small.copy()
+            vis[mask > 0] = (0, 0, 255)
+            for i in range(1, n):
+                x, y, w, hh = (stats[i, cv2.CC_STAT_LEFT],
+                               stats[i, cv2.CC_STAT_TOP],
+                               stats[i, cv2.CC_STAT_WIDTH],
+                               stats[i, cv2.CC_STAT_HEIGHT])
+                area_real = int(stats[i, cv2.CC_STAT_AREA] * px_factor)
+                ok = self.min_area <= area_real <= self.max_area
+                cv2.rectangle(vis, (x - 2, y - 2), (x + w + 2, y + hh + 2),
+                              (0, 255, 0) if ok else (0, 255, 255), 1)
+                cv2.putText(vis, str(area_real), (x, max(8, y - 4)),
+                            cv2.FONT_HERSHEY_PLAIN, 0.7,
+                            (0, 255, 0) if ok else (0, 255, 255), 1)
+            try:
+                cv2.imwrite(DEBUG_IMG, vis)
+            except Exception:
+                pass
+        return found
+
+    def pick_color_at_cursor(self):
+        """Lee el color bajo el ratón. Devuelve (h, s, v, b, g, r)."""
+        x, y = MouseController().position
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+            left = max(mon["left"], min(x - 2, mon["left"] + mon["width"] - 5))
+            top = max(mon["top"], min(y - 2, mon["top"] + mon["height"] - 5))
+            img = np.asarray(sct.grab({"left": int(left), "top": int(top),
+                                       "width": 5, "height": 5}))
+        patch = img[:, :, :3].reshape(-1, 3)
+        # mediana: robusta frente a un borde o un píxel de sombra
+        bgr = np.median(patch, axis=0).astype(np.uint8)
+        hsv = cv2.cvtColor(bgr.reshape(1, 1, 3), cv2.COLOR_BGR2HSV)[0, 0]
+        return (int(hsv[0]), int(hsv[1]), int(hsv[2]),
+                int(bgr[0]), int(bgr[1]), int(bgr[2]))
+
+
 # ---------------------------------------------------------------- auto-captcha
 
 class CaptchaWatcher:
-    """Vigila la pantalla y clica la zona verde cuando aparece.
+    """Vigila la pantalla y clica la zona del color buscado cuando aparece.
 
-    Detección por color en HSV sobre captura de pantalla (mss + OpenCV).
-    Exige ver el blob en 2 frames seguidos antes de clicar (anti-falsos
+    Exige ver el blob en 2 escaneos seguidos antes de clicar (anti-falsos
     positivos) y aplica un cooldown tras cada clic.
     """
 
-    def __init__(self, log_fn):
+    def __init__(self, finder, log_fn):
+        self.finder = finder
         self.mouse = MouseController()
         self.log = log_fn
         self.active = False
         self.paused = False           # se pausa durante grabación/reproducción
         self._thread = None
-        # Parámetros configurables desde la GUI:
-        self.hue = 60                 # verde puro en OpenCV (rango 0-179: 60)
-        self.hue_tol = 15
-        self.sat_min = 120
-        self.val_min = 120
-        self.min_area = 400           # px² a resolución reducida (x0.5 -> x4 real)
         self.interval = 0.7           # s entre escaneos
         self.cooldown = 10.0          # s tras un clic
         self.double_click = False
@@ -287,31 +397,8 @@ class CaptchaWatcher:
     def stop(self):
         self.active = False
 
-    def detect_once(self):
-        """Un escaneo puntual. Devuelve (x, y, area) o None."""
-        with mss.mss() as sct:
-            mon = sct.monitors[1]
-            img = np.asarray(sct.grab(mon))          # BGRA
-        small = cv2.resize(img[:, :, :3], None, fx=0.5, fy=0.5,
-                           interpolation=cv2.INTER_AREA)
-        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        lo = np.array([max(0, self.hue - self.hue_tol), self.sat_min, self.val_min])
-        hi = np.array([min(179, self.hue + self.hue_tol), 255, 255])
-        mask = cv2.inRange(hsv, lo, hi)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                                np.ones((3, 3), np.uint8))
-        n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
-        best = None
-        for i in range(1, n):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if area >= self.min_area and (best is None or area > best[2]):
-                cx, cy = centroids[i]
-                best = (int(cx * 2) + mon["left"],
-                        int(cy * 2) + mon["top"], int(area))
-        return best
-
     def _run(self):
-        pending = None  # detección del frame anterior, esperando confirmación
+        pending = None  # detección del escaneo anterior, esperando confirmación
         last_click = 0.0
         while self.active:
             time.sleep(self.interval)
@@ -321,37 +408,40 @@ class CaptchaWatcher:
             if time.perf_counter() - last_click < self.cooldown:
                 continue
             try:
-                found = self.detect_once()
+                found = self.finder.candidates()
             except Exception as exc:
                 self.log(f"Error de captura: {exc}")
                 continue
-            if found is None:
+            if not found:
                 pending = None
                 continue
-            x, y, area = found
+            x, y, area = found[0]
             if pending is None or abs(pending[0] - x) > 40 or abs(pending[1] - y) > 40:
                 pending = (x, y)      # 1ª vez: esperar confirmación
                 continue
-            # Confirmado en 2 frames: clic
-            prev = self.mouse.position
-            self.mouse.position = (x, y)
-            time.sleep(0.05)
-            self.mouse.press(Button.left)
-            time.sleep(0.03)
-            self.mouse.release(Button.left)
-            if self.double_click:
-                time.sleep(0.08)
-                self.mouse.press(Button.left)
-                time.sleep(0.03)
-                self.mouse.release(Button.left)
-            if self.restore_mouse:
-                time.sleep(0.05)
-                self.mouse.position = prev
+            self._click(x, y)
             self.clicks_done += 1
             last_click = time.perf_counter()
             pending = None
-            self.log(f"Captcha clicado en ({x}, {y}) — área {area * 4} px²  "
+            extra = f" (+{len(found) - 1} candidatos más)" if len(found) > 1 else ""
+            self.log(f"Clic en ({x}, {y}) — área {area} px²{extra}  "
                      f"[total: {self.clicks_done}]")
+
+    def _click(self, x, y):
+        prev = self.mouse.position
+        self.mouse.position = (x, y)
+        time.sleep(0.05)
+        self.mouse.press(Button.left)
+        time.sleep(0.03)
+        self.mouse.release(Button.left)
+        if self.double_click:
+            time.sleep(0.08)
+            self.mouse.press(Button.left)
+            time.sleep(0.03)
+            self.mouse.release(Button.left)
+        if self.restore_mouse:
+            time.sleep(0.05)
+            self.mouse.position = prev
 
 
 # ---------------------------------------------------------------- GUI
@@ -360,20 +450,23 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("MacroPro — Grabador de macros + Auto-Captcha")
-        root.geometry("560x640")
+        root.geometry("580x740")
         root.attributes("-topmost", True)
 
         self.recorder = Recorder()
         self.player = Player(on_finish=self._on_play_finish,
                              on_progress=self._on_play_progress)
-        self.watcher = CaptchaWatcher(self.log)
+        self.finder = ColorFinder()
+        self.watcher = CaptchaWatcher(self.finder, self.log)
         self.events = []
         self.current_file = None
 
         self._build_ui()
         self._load_config()
         self._start_hotkeys()
-        self.log("Listo. F6 = grabar | F7 = reproducir | F9 = auto-captcha")
+        self.log("Listo. F6 grabar | F7 reproducir | F8 cuentagotas | "
+                 "F9 auto-captcha")
+        self.log("Para calibrar: pon el ratón sobre el cristal verde y pulsa F8.")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------- construcción de la interfaz ----------
@@ -414,16 +507,25 @@ class App:
 
         # --- sección auto-captcha ---
         fc = ttk.LabelFrame(
-            self.root, text=" Auto-Captcha (clic automático en zona verde) ")
+            self.root, text=" Auto-Captcha (clic automático en el color) ")
         fc.pack(fill="x", **pad)
+
+        rowc0 = ttk.Frame(fc)
+        rowc0.pack(fill="x", **pad)
+        ttk.Button(rowc0, text="🎨 Calibrar con cuentagotas (F8)",
+                   command=self.pick_color).pack(side="left", padx=4)
+        self.lbl_color = ttk.Label(rowc0, text="color sin calibrar")
+        self.lbl_color.pack(side="left", padx=8)
 
         rowc1 = ttk.Frame(fc)
         rowc1.pack(fill="x", **pad)
         self.btn_captcha = ttk.Button(rowc1, text="Activar vigilancia (F9)",
                                       command=self.toggle_captcha)
         self.btn_captcha.pack(side="left", padx=4)
-        ttk.Button(rowc1, text="Probar detección ahora",
+        ttk.Button(rowc1, text="Probar detección (3 s)",
                    command=self.test_detection).pack(side="left", padx=4)
+        ttk.Button(rowc1, text="Ver imagen de depuración",
+                   command=self.open_debug).pack(side="left", padx=4)
 
         grid = ttk.Frame(fc)
         grid.pack(fill="x", **pad)
@@ -431,24 +533,30 @@ class App:
         def spin(row, col, label, var, lo, hi, inc=1):
             ttk.Label(grid, text=label).grid(row=row, column=col * 2,
                                              sticky="e", padx=4, pady=2)
-            sb = ttk.Spinbox(grid, textvariable=var, from_=lo, to=hi,
-                             increment=inc, width=7)
-            sb.grid(row=row, column=col * 2 + 1, sticky="w", padx=4, pady=2)
+            ttk.Spinbox(grid, textvariable=var, from_=lo, to=hi,
+                        increment=inc, width=8).grid(
+                row=row, column=col * 2 + 1, sticky="w", padx=4, pady=2)
 
-        self.var_hue = tk.StringVar(value="60")
-        self.var_hue_tol = tk.StringVar(value="15")
-        self.var_sat = tk.StringVar(value="120")
-        self.var_val = tk.StringVar(value="120")
-        self.var_area = tk.StringVar(value="400")
+        self.var_hue = tk.StringVar(value="48")
+        self.var_hue_tol = tk.StringVar(value="12")
+        self.var_sat = tk.StringVar(value="40")
+        self.var_val = tk.StringVar(value="90")
+        self.var_area = tk.StringVar(value="80")
+        self.var_area_max = tk.StringVar(value="40000")
         self.var_interval = tk.StringVar(value="0.7")
         self.var_cooldown = tk.StringVar(value="10")
-        spin(0, 0, "Tono verde (0-179):", self.var_hue, 0, 179)
+        self.var_roi_top = tk.StringVar(value="0")
+        self.var_roi_bottom = tk.StringVar(value="100")
+        spin(0, 0, "Tono (0-179):", self.var_hue, 0, 179)
         spin(0, 1, "± tolerancia:", self.var_hue_tol, 1, 60)
         spin(1, 0, "Saturación mín.:", self.var_sat, 0, 255)
         spin(1, 1, "Brillo mín.:", self.var_val, 0, 255)
-        spin(2, 0, "Área mínima (px²):", self.var_area, 50, 100000, 50)
-        spin(2, 1, "Escaneo cada (s):", self.var_interval, 0.2, 10, 0.1)
-        spin(3, 0, "Cooldown tras clic (s):", self.var_cooldown, 1, 3600)
+        spin(2, 0, "Área mín. (px²):", self.var_area, 10, 100000, 10)
+        spin(2, 1, "Área máx. (px²):", self.var_area_max, 100, 5000000, 1000)
+        spin(3, 0, "Buscar desde (% alto):", self.var_roi_top, 0, 99)
+        spin(3, 1, "hasta (% alto):", self.var_roi_bottom, 1, 100)
+        spin(4, 0, "Escaneo cada (s):", self.var_interval, 0.2, 10, 0.1)
+        spin(4, 1, "Cooldown (s):", self.var_cooldown, 1, 3600)
 
         rowc2 = ttk.Frame(fc)
         rowc2.pack(fill="x", **pad)
@@ -462,7 +570,7 @@ class App:
         # --- registro ---
         fl = ttk.LabelFrame(self.root, text=" Registro ")
         fl.pack(fill="both", expand=True, **pad)
-        self.txt_log = tk.Text(fl, height=10, state="disabled",
+        self.txt_log = tk.Text(fl, height=11, state="disabled",
                                font=("Consolas", 9))
         self.txt_log.pack(fill="both", expand=True, padx=4, pady=4)
 
@@ -483,14 +591,17 @@ class App:
     def set_status(self, text):
         self.root.after(0, lambda: self.status.configure(text=text))
 
-    def _apply_watcher_settings(self):
-        w = self.watcher
+    def _apply_settings(self):
+        f, w = self.finder, self.watcher
         try:
-            w.hue = int(float(self.var_hue.get()))
-            w.hue_tol = int(float(self.var_hue_tol.get()))
-            w.sat_min = int(float(self.var_sat.get()))
-            w.val_min = int(float(self.var_val.get()))
-            w.min_area = int(float(self.var_area.get())) // 4  # escala x0.5
+            f.hue = int(float(self.var_hue.get()))
+            f.hue_tol = int(float(self.var_hue_tol.get()))
+            f.sat_min = int(float(self.var_sat.get()))
+            f.val_min = int(float(self.var_val.get()))
+            f.min_area = int(float(self.var_area.get()))
+            f.max_area = int(float(self.var_area_max.get()))
+            f.roi_top = float(self.var_roi_top.get()) / 100.0
+            f.roi_bottom = float(self.var_roi_bottom.get()) / 100.0
             w.interval = max(0.2, float(self.var_interval.get()))
             w.cooldown = float(self.var_cooldown.get())
             w.double_click = self.var_double.get()
@@ -498,6 +609,28 @@ class App:
         except ValueError:
             self.log("Aviso: algún parámetro no es un número válido; "
                      "se mantienen los anteriores.")
+
+    # ---------- cuentagotas ----------
+    def pick_color(self):
+        try:
+            h, s, v, b, g, r = self.finder.pick_color_at_cursor()
+        except Exception as exc:
+            self.log(f"Error leyendo el color: {exc}")
+            return
+        # Rango generoso alrededor de la muestra: los sprites tienen sombras y
+        # los cristales translúcidos varían según el fondo.
+        self.var_hue.set(str(h))
+        self.var_hue_tol.set("12")
+        self.var_sat.set(str(max(25, s - 60)))
+        self.var_val.set(str(max(50, v - 60)))
+        self._apply_settings()
+        self.lbl_color.configure(
+            text=f"RGB({r},{g},{b})  H={h} S={s} V={v}")
+        self.log(f"Color capturado: RGB({r},{g},{b}) → tono {h}, "
+                 f"saturación {s}, brillo {v}. Rango ajustado: tono "
+                 f"{h}±12, sat≥{max(25, s - 60)}, brillo≥{max(50, v - 60)}.")
+        self.log("Ahora pulsa 'Probar detección' para comprobar que lo "
+                 "encuentra sin clicar.")
 
     # ---------- macro ----------
     def toggle_record(self):
@@ -595,7 +728,7 @@ class App:
     # ---------- captcha ----------
     def toggle_captcha(self):
         if not self.watcher.active:
-            self._apply_watcher_settings()
+            self._apply_settings()
             self.watcher.start()
             self.btn_captcha.configure(text="Desactivar vigilancia (F9)")
             self.log("Auto-Captcha ACTIVADO: vigilando la pantalla…")
@@ -605,25 +738,41 @@ class App:
             self.log("Auto-Captcha desactivado.")
 
     def test_detection(self):
-        self._apply_watcher_settings()
-        self.log("Probando detección en 3 segundos — pon la pantalla "
-                 "como cuando sale el captcha…")
+        self._apply_settings()
+        self.log("Probando en 3 segundos — deja la pantalla como cuando "
+                 "sale el aviso…")
 
         def _do():
             time.sleep(3)
             try:
-                found = self.watcher.detect_once()
+                found = self.finder.candidates(save_debug=True)
             except Exception as exc:
                 self.log(f"Error: {exc}")
                 return
-            if found:
-                x, y, area = found
-                self.log(f"DETECTADO: zona verde en ({x}, {y}), "
-                         f"área ≈ {area * 4} px². (No se ha clicado.)")
+            if not found:
+                self.log("NO detectado con los parámetros actuales. Prueba a "
+                         "bajar 'Área mín.', bajar 'Saturación mín.' o subir "
+                         "la tolerancia de tono.")
             else:
-                self.log("No se detectó ninguna zona verde con los "
-                         "parámetros actuales. Ajusta tono/tolerancia/área.")
+                self.log(f"{len(found)} candidato(s). El primero es el que "
+                         f"se clicaría:")
+                for i, (x, y, a) in enumerate(found[:5], 1):
+                    self.log(f"   {i}. ({x}, {y})  área {a} px²")
+                if len(found) > 1:
+                    self.log("Hay más de un candidato: si el correcto no es "
+                             "el nº 1, acota la zona de búsqueda (% alto) o "
+                             "aprieta la tolerancia de tono.")
+            self.log(f"Imagen de depuración guardada en {DEBUG_IMG}")
         threading.Thread(target=_do, daemon=True).start()
+
+    def open_debug(self):
+        if not os.path.exists(DEBUG_IMG):
+            self.log("Aún no hay imagen de depuración: usa 'Probar detección'.")
+            return
+        try:
+            os.startfile(DEBUG_IMG)
+        except Exception as exc:
+            self.log(f"No se pudo abrir: {exc}")
 
     # ---------- hotkeys ----------
     def _start_hotkeys(self):
@@ -632,40 +781,42 @@ class App:
                 self.root.after(0, self.toggle_record)
             elif key == HOTKEY_PLAY:
                 self.root.after(0, self.toggle_play)
+            elif key == HOTKEY_PICK:
+                self.root.after(0, self.pick_color)
             elif key == HOTKEY_CAPTCHA:
                 self.root.after(0, self.toggle_captcha)
         self._hotkey_listener = keyboard.Listener(on_press=on_press)
         self._hotkey_listener.start()
 
     # ---------- configuración ----------
+    def _cfg_map(self):
+        return {
+            "hue": self.var_hue, "hue_tol": self.var_hue_tol,
+            "sat": self.var_sat, "val": self.var_val,
+            "area": self.var_area, "area_max": self.var_area_max,
+            "roi_top": self.var_roi_top, "roi_bottom": self.var_roi_bottom,
+            "interval": self.var_interval, "cooldown": self.var_cooldown,
+            "repeats": self.var_repeats, "speed": self.var_speed,
+        }
+
     def _load_config(self):
         try:
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 cfg = json.load(f)
         except Exception:
+            self._apply_settings()
             return
-        mapping = {
-            "hue": self.var_hue, "hue_tol": self.var_hue_tol,
-            "sat": self.var_sat, "val": self.var_val,
-            "area": self.var_area, "interval": self.var_interval,
-            "cooldown": self.var_cooldown, "repeats": self.var_repeats,
-            "speed": self.var_speed,
-        }
-        for k, var in mapping.items():
+        for k, var in self._cfg_map().items():
             if k in cfg:
                 var.set(str(cfg[k]))
         self.var_double.set(cfg.get("double", False))
         self.var_restore.set(cfg.get("restore", True))
+        self._apply_settings()
 
     def _save_config(self):
-        cfg = {
-            "hue": self.var_hue.get(), "hue_tol": self.var_hue_tol.get(),
-            "sat": self.var_sat.get(), "val": self.var_val.get(),
-            "area": self.var_area.get(), "interval": self.var_interval.get(),
-            "cooldown": self.var_cooldown.get(),
-            "repeats": self.var_repeats.get(), "speed": self.var_speed.get(),
-            "double": self.var_double.get(), "restore": self.var_restore.get(),
-        }
+        cfg = {k: var.get() for k, var in self._cfg_map().items()}
+        cfg["double"] = self.var_double.get()
+        cfg["restore"] = self.var_restore.get()
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
