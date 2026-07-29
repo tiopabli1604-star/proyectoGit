@@ -59,17 +59,46 @@ verlo en **dos escaneos seguidos** antes de actuar, y luego respeta un tiempo de
 espera (cooldown) configurable. Puede devolver el ratón a donde estaba y pitar
 al clicar, y la barra de estado lleva la cuenta de clics y la hora del último.
 
+Además exige que el objetivo esté **sobre el gris de una interfaz**: mira un
+anillo alrededor de la mancha y comprueba que el fondo está casi sin saturación,
+como el panel de un cofre. Eso es lo que distingue un objeto en una casilla de un
+trozo de paisaje del mismo color — sin ese filtro, las hojas o el césped
+iluminados forman manchas del tamaño exacto de una casilla y se llevan el clic.
+Si tu objetivo no está dentro de una interfaz, desmarca "Solo sobre una
+interfaz".
+
+Cada clic automático guarda además una captura marcada con una cruz roja donde ha
+clicado (`golem_clic_1.png` … `_3.png`, rotando). Es la forma de auditar un clic
+que ocurrió mientras no mirabas: el botón **Ver último clic** abre la más
+reciente.
+
 Hay dos formas de decirle qué buscar:
+
+### Objetos encantados
+
+Si el objetivo es un objeto **encantado**, lleva encima el brillo morado animado
+que barre el sprite. En cada instante tapa una parte distinta, así que una sola
+captura ve el color roto en trozos que cambian de forma y de tamaño.
+
+Por eso el vigilante **une varios fotogramas** en cada escaneo (ajuste
+"Fotogramas unidos", 3 por defecto): un píxel cuenta si tenía el color buscado en
+*alguna* de las capturas, y luego un cierre morfológico vuelve a pegar los trozos
+en una sola mancha. El cuentagotas hace lo mismo en el tiempo — cinco lecturas y
+se queda con la mediana — y te avisa en el registro si ve que el color
+parpadeaba.
+
+Con objetos encantados **no uses el modo Imagen de referencia**: la plantilla
+guardaría el brillo en una posición que no se repite nunca.
 
 ### Modo Color
 
 Máscara de color HSV: rápido, y funciona aunque el objeto cambie de tamaño.
 
 **1. Cuentagotas.** Deja en pantalla el objeto que hay que clicar, pon el ratón
-justo encima y pulsa **F8**. El programa lee el color exacto de esos píxeles
-(mediana de un cuadro de 5×5, para no tragarse un borde o una sombra) y ajusta
-solo el tono, la saturación y el brillo con un margen generoso. En el registro
-verás el RGB y el rango que ha fijado.
+justo encima y pulsa **F8**. El programa lee el color de esos píxeles (mediana de
+un cuadro de 5×5 y de cinco lecturas seguidas, para no tragarse un borde, una
+sombra ni un brillo animado) y ajusta solo el tono, la saturación y el brillo con
+un margen generoso. En el registro verás el RGB y el rango que ha fijado.
 
 Esto es lo que evita adivinar números: un cristal translúcido de Minecraft sale
 con tono ~45 y saturación baja, muy lejos de los valores de un verde puro.
@@ -78,9 +107,13 @@ con tono ~45 y saturación baja, muy lejos de los valores de un verde puro.
 cuando aparece el aviso y mira el registro: lista todos los candidatos con sus
 coordenadas y su área, **sin hacer clic**. El nº 1 es el que se clicaría.
 
+Los descartados salen con el motivo escrito: demasiado pequeño, demasiado grande,
+demasiado ancho para una casilla o "no está sobre una interfaz gris". Eso te dice
+qué ajuste tocar en vez de tener que adivinarlo.
+
 También guarda `golem_debug.png` junto al ejecutable, con los píxeles detectados
-en rojo y cada candidato recuadrado (verde = aceptado, amarillo = descartado por
-área). El botón **Ver imagen de depuración** lo abre.
+en rojo y cada candidato recuadrado (verde = aceptado, amarillo = descartado). El
+botón **Ver imagen de depuración** lo abre.
 
 ### Modo Imagen de referencia
 
@@ -104,9 +137,15 @@ Cuando en el registro aparece más de un candidato y el correcto no es el nº 1
 - **Área mín. / máx. (px²)** — el objeto de una casilla ronda unos cientos de
   px²; súbele el mínimo para descartar motas de color y bájale el máximo para
   descartar paredes o fondos grandes del mismo tono.
+- **Lado máx. (px)** — descarta manchas más anchas o más altas que una casilla,
+  como una pared o el césped del fondo. Es el filtro que más falsos positivos
+  quita, porque una mancha inmensa puede tener un área dentro del límite si es
+  delgada.
 - **± tolerancia** — bájala para exigir un color más parecido al capturado.
+- **Solo sobre una interfaz** — déjalo marcado si el objetivo aparece dentro de
+  un menú o un cofre.
 - O cambia al **modo Imagen de referencia**, que distingue la textura y no solo
-  el tono.
+  el tono (salvo con objetos encantados).
 
 Los dos módulos conviven: el vigilante se pausa solo mientras grabas o
 reproduces una macro.

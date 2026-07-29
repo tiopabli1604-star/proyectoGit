@@ -59,6 +59,7 @@ APP_NAME = "Golem"
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_PATH = os.path.join(APP_DIR, "golem_config.json")
 DEBUG_IMG = os.path.join(APP_DIR, "golem_debug.png")
+SHOT_PATH = os.path.join(APP_DIR, "golem_clic_%d.png")
 TEMPLATE_IMG = os.path.join(APP_DIR, "golem_plantilla.png")
 LOG_PATH = os.path.join(APP_DIR, "golem_log.txt")
 
@@ -300,13 +301,19 @@ class Finder:
         self.val_min = 90
         self.min_area = 80      # px² reales
         self.max_area = 40000   # px² reales; descarta paredes/fondos enormes
+        self.frames = 3         # fotogramas que se unen en cada escaneo
+        self.frame_gap = 0.10   # s entre esos fotogramas
+        self.max_side = 80      # lado máx. del objetivo en px reales
+        self.on_gui = True      # exigir fondo gris de interfaz alrededor
         # --- plantilla ---
         self.template = None
         self.tpl_size = 40      # lado del recorte que captura F4
         self.tpl_thr = 0.85     # correlación mínima para aceptar
+        self.last_score = 0.0
         # --- común ---
         self.roi_top = 0.0      # fracción de pantalla donde empieza la búsqueda
         self.roi_bottom = 1.0   # y donde acaba
+        self.rejects = []       # motivos de descarte del último escaneo
         self.load_template()
 
     # ---- captura de pantalla ----
@@ -346,33 +353,89 @@ class Finder:
                                np.array([hi_h, 255, 255]))
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
-    def _color_candidates(self, bgr, mon, y_ini, save_debug):
-        small = cv2.resize(bgr, None, fx=SCALE, fy=SCALE,
-                           interpolation=cv2.INTER_AREA)
-        mask = self.build_mask(small)
+    def _on_gui_panel(self, hsv, x, y, w, h):
+        """¿El objetivo está sobre el gris de una interfaz?
+
+        Mira un anillo alrededor del objeto. En un cofre el fondo es gris casi
+        sin saturación; sobre el césped, las hojas o el agua es un color vivo.
+        Es lo que distingue un objeto en una casilla de un trozo de paisaje.
+        """
+        alto, ancho = hsv.shape[:2]
+        m = max(4, int(min(w, h) * 0.9))
+        x0, x1 = max(0, x - m), min(ancho, x + w + m)
+        y0, y1 = max(0, y - m), min(alto, y + h + m)
+        zona = hsv[y0:y1, x0:x1]
+        if zona.size == 0:
+            return True
+        anillo = np.ones(zona.shape[:2], bool)
+        anillo[y - y0:y + h - y0, x - x0:x + w - x0] = False  # fuera el objeto
+        if not anillo.any():
+            return True
+        return float(np.median(zona[:, :, 1][anillo])) < 60
+
+    def _color_candidates(self, save_debug=False):
+        """Máscara de color sobre la unión de varios fotogramas.
+
+        Un objeto encantado lleva un brillo que barre el sprite y tapa una
+        parte distinta en cada instante, así que en un solo fotograma el color
+        aparece roto en trozos. Uniendo 3 capturas seguidas cada píxel cuenta
+        si era del color buscado en *alguna* de ellas, y un cierre morfológico
+        vuelve a pegar los trozos en una sola mancha.
+        """
+        mask = None
+        small = mon = y_ini = None
+        for i in range(max(1, int(self.frames))):
+            if i:
+                time.sleep(max(0.0, self.frame_gap))
+            bgr, mon = self.grab_screen()
+            band, y_ini = self._band(bgr)
+            small = cv2.resize(band, None, fx=SCALE, fy=SCALE,
+                               interpolation=cv2.INTER_AREA)
+            m = self.build_mask(small)
+            mask = m if mask is None else cv2.bitwise_or(mask, m)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                                np.ones((5, 5), np.uint8))
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
 
         px_factor = 1.0 / (SCALE * SCALE)  # área reducida -> área real
-        found = []
+        found, rechazos, marcas = [], [], []
         for i in range(1, n):
-            area_real = stats[i, cv2.CC_STAT_AREA] * px_factor
-            if self.min_area <= area_real <= self.max_area:
-                cx, cy = centroids[i]
-                found.append((int(cx / SCALE) + mon["left"],
-                              int(cy / SCALE) + y_ini + mon["top"],
-                              int(area_real), 0.0))
+            x, y, w, hh = (stats[i, cv2.CC_STAT_LEFT],
+                           stats[i, cv2.CC_STAT_TOP],
+                           stats[i, cv2.CC_STAT_WIDTH],
+                           stats[i, cv2.CC_STAT_HEIGHT])
+            area_real = int(stats[i, cv2.CC_STAT_AREA] * px_factor)
+            lado_real = int(max(w, hh) / SCALE)
+            cx, cy = centroids[i]
+            px = int(cx / SCALE) + mon["left"]
+            py = int(cy / SCALE) + y_ini + mon["top"]
+
+            if area_real < self.min_area:
+                motivo = f"área {area_real} px² < mínimo {self.min_area}"
+            elif area_real > self.max_area:
+                motivo = f"área {area_real} px² > máximo {self.max_area}"
+            elif lado_real > self.max_side:
+                motivo = (f"mide {lado_real} px de lado > máximo "
+                          f"{self.max_side}: demasiado grande para una casilla")
+            elif self.on_gui and not self._on_gui_panel(hsv, x, y, w, hh):
+                motivo = "no está sobre una interfaz gris (parece paisaje)"
+            else:
+                motivo = None
+
+            if motivo is None:
+                found.append((px, py, area_real, 0.0))
+            elif area_real >= 20:   # no llenar el registro de motas de color
+                rechazos.append(f"({px}, {py}) descartado: {motivo}")
+            marcas.append((x, y, w, hh, area_real, motivo is None))
+
         found.sort(key=lambda c: -c[2])
+        self.rejects = rechazos
 
         if save_debug:
             vis = small.copy()
             vis[mask > 0] = (0, 0, 255)
-            for i in range(1, n):
-                x, y, w, hh = (stats[i, cv2.CC_STAT_LEFT],
-                               stats[i, cv2.CC_STAT_TOP],
-                               stats[i, cv2.CC_STAT_WIDTH],
-                               stats[i, cv2.CC_STAT_HEIGHT])
-                area_real = int(stats[i, cv2.CC_STAT_AREA] * px_factor)
-                ok = self.min_area <= area_real <= self.max_area
+            for x, y, w, hh, area_real, ok in marcas:
                 col = (0, 255, 0) if ok else (0, 255, 255)
                 cv2.rectangle(vis, (x - 2, y - 2), (x + w + 2, y + hh + 2),
                               col, 1)
@@ -444,27 +507,43 @@ class Finder:
     # ---- entrada única ----
     def candidates(self, save_debug=False):
         """[(x, y, area, score), ...] ordenado de mejor a peor."""
-        bgr, mon = self.grab_screen()
-        band, y_ini = self._band(bgr)
+        self.rejects = []
         if self.mode == "plantilla":
+            bgr, mon = self.grab_screen()
+            band, y_ini = self._band(bgr)
             return self._template_candidates(band, mon, y_ini, save_debug)
-        return self._color_candidates(band, mon, y_ini, save_debug)
+        return self._color_candidates(save_debug)
 
-    def pick_color_at_cursor(self):
-        """Lee el color bajo el ratón. Devuelve (h, s, v, b, g, r)."""
+    def pick_color_at_cursor(self, muestras=5, gap=0.06):
+        """Lee el color bajo el ratón. Devuelve (h, s, v, b, g, r, inestable).
+
+        Toma varias muestras de 5x5 separadas en el tiempo y se queda con la
+        mediana de todas. Con un objeto encantado el brillo morado pasa por
+        encima del sprite, así que una sola lectura puede pillar el brillo en
+        vez del color de debajo; la mediana temporal lo ignora mientras el
+        brillo no tape el punto más de la mitad del tiempo.
+        """
         x, y = MouseController().position
+        parches = []
         with mss.mss() as sct:
             mon = sct.monitors[1]
             left = max(mon["left"], min(x - 2, mon["left"] + mon["width"] - 5))
             top = max(mon["top"], min(y - 2, mon["top"] + mon["height"] - 5))
-            img = np.asarray(sct.grab({"left": int(left), "top": int(top),
-                                       "width": 5, "height": 5}))
-        patch = img[:, :, :3].reshape(-1, 3)
-        # mediana: robusta frente a un borde o un píxel de sombra
-        bgr = np.median(patch, axis=0).astype(np.uint8)
+            caja = {"left": int(left), "top": int(top), "width": 5, "height": 5}
+            for i in range(max(1, muestras)):
+                if i:
+                    time.sleep(gap)
+                parches.append(np.asarray(sct.grab(caja))[:, :, :3])
+        pila = np.concatenate([p.reshape(-1, 3) for p in parches])
+        bgr = np.median(pila, axis=0).astype(np.uint8)
         hsv = cv2.cvtColor(bgr.reshape(1, 1, 3), cv2.COLOR_BGR2HSV)[0, 0]
+
+        # ¿varía mucho de una muestra a otra? Entonces hay algo animado encima.
+        medias = [p.reshape(-1, 3).mean(axis=0) for p in parches]
+        inestable = bool(len(medias) > 1 and
+                         np.max(np.ptp(np.array(medias), axis=0)) > 25)
         return (int(hsv[0]), int(hsv[1]), int(hsv[2]),
-                int(bgr[0]), int(bgr[1]), int(bgr[2]))
+                int(bgr[0]), int(bgr[1]), int(bgr[2]), inestable)
 
 
 # ---------------------------------------------------------------- vigilante
@@ -489,6 +568,8 @@ class Watcher:
         self.double_click = False
         self.restore_mouse = True
         self.sound = True
+        self.shots = True             # guardar captura de cada clic
+        self.move_delay = 0.20        # s entre mover el ratón y pulsar
         self.clicks_done = 0
         self.last_click_time = None
 
@@ -536,6 +617,7 @@ class Watcher:
             if pending is None or abs(pending[0] - x) > 40 or abs(pending[1] - y) > 40:
                 pending = (x, y)      # 1ª vez: esperar confirmación
                 continue
+            shot = self._save_shot(x, y, self.clicks_done + 1) if self.shots else None
             self._click(x, y)
             self.clicks_done += 1
             self.last_click_time = time.strftime("%H:%M:%S")
@@ -545,25 +627,47 @@ class Watcher:
                    else f"área {area} px²")
             extra = f" (+{len(found) - 1} candidatos más)" if len(found) > 1 else ""
             self.log(f"Clic en ({x}, {y}) — {det}{extra}  "
-                     f"[total: {self.clicks_done}]")
+                     f"[total: {self.clicks_done}]"
+                     + (f"  captura: {shot}" if shot else ""))
             if self.sound:
                 beep(True)
 
     def _click(self, x, y):
         prev = self.mouse.position
         self.mouse.position = (x, y)
-        time.sleep(0.05)
+        # Un juego a 60 fps tarda un fotograma o dos en enterarse de que el
+        # cursor se ha movido. Si pulsamos antes, el clic se procesa con la
+        # casilla anterior bajo el ratón y no cuenta.
+        time.sleep(self.move_delay)
         self.mouse.press(Button.left)
-        time.sleep(0.03)
+        time.sleep(0.06)
         self.mouse.release(Button.left)
         if self.double_click:
-            time.sleep(0.08)
+            time.sleep(0.10)
             self.mouse.press(Button.left)
-            time.sleep(0.03)
+            time.sleep(0.06)
             self.mouse.release(Button.left)
         if self.restore_mouse:
-            time.sleep(0.05)
+            time.sleep(0.20)   # deja que el juego procese el clic antes de irse
             self.mouse.position = prev
+
+    def _save_shot(self, x, y, n):
+        """Guarda una captura marcando dónde va a clicar, para poder auditarlo."""
+        try:
+            bgr, mon = self.finder.grab_screen()
+            vis = bgr.copy()
+            px, py = int(x - mon["left"]), int(y - mon["top"])
+            cv2.drawMarker(vis, (px, py), (0, 0, 255), cv2.MARKER_CROSS, 44, 2)
+            cv2.circle(vis, (px, py), 28, (0, 0, 255), 2)
+            cv2.putText(vis, f"clic #{n} en ({x}, {y})",
+                        (max(4, px - 130), max(24, py - 38)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            path = SHOT_PATH % (n % 3 + 1)
+            cv2.imwrite(path, cv2.resize(vis, None, fx=0.5, fy=0.5,
+                                         interpolation=cv2.INTER_AREA))
+            return os.path.basename(path)
+        except Exception:
+            return None
 
 
 # ---------------------------------------------------------------- GUI
@@ -693,7 +797,9 @@ class App:
         self.var_area_max = tk.StringVar(value="40000")
         self.var_tpl_size = tk.StringVar(value="40")
         self.var_tpl_thr = tk.StringVar(value="0.85")
-        self.var_interval = tk.StringVar(value="0.7")
+        self.var_frames = tk.StringVar(value="3")
+        self.var_max_side = tk.StringVar(value="80")
+        self.var_interval = tk.StringVar(value="1.2")
         self.var_cooldown = tk.StringVar(value="10")
         self.var_roi_top = tk.StringVar(value="0")
         self.var_roi_bottom = tk.StringVar(value="100")
@@ -709,6 +815,8 @@ class App:
         spin(4, 1, "hasta (% alto):", self.var_roi_bottom, 1, 100)
         spin(5, 0, "Escaneo cada (s):", self.var_interval, 0.2, 10, 0.1)
         spin(5, 1, "Cooldown (s):", self.var_cooldown, 1, 3600)
+        spin(6, 0, "Lado máx. (px):", self.var_max_side, 10, 2000, 10)
+        spin(6, 1, "Fotogramas unidos:", self.var_frames, 1, 6)
 
         rowc2 = ttk.Frame(fc)
         rowc2.pack(fill="x", **pad)
@@ -721,6 +829,19 @@ class App:
         self.var_sound = tk.BooleanVar(value=True)
         ttk.Checkbutton(rowc2, text="Pitido al clicar",
                         variable=self.var_sound).pack(side="left", padx=10)
+
+        rowc3 = ttk.Frame(fc)
+        rowc3.pack(fill="x", **pad)
+        self.var_on_gui = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rowc3, text="Solo sobre una interfaz (fondo gris)",
+                        variable=self.var_on_gui,
+                        command=self._apply_settings).pack(side="left")
+        self.var_shots = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rowc3, text="Guardar captura de cada clic",
+                        variable=self.var_shots,
+                        command=self._apply_settings).pack(side="left", padx=10)
+        ttk.Button(rowc3, text="Ver último clic",
+                   command=self.open_shot).pack(side="left", padx=4)
 
         # --- opciones generales ---
         fo = ttk.Frame(self.root)
@@ -779,6 +900,9 @@ class App:
             f.val_min = int(float(self.var_val.get()))
             f.min_area = int(float(self.var_area.get()))
             f.max_area = int(float(self.var_area_max.get()))
+            f.max_side = int(float(self.var_max_side.get()))
+            f.frames = max(1, int(float(self.var_frames.get())))
+            f.on_gui = self.var_on_gui.get()
             f.tpl_size = int(float(self.var_tpl_size.get()))
             f.tpl_thr = float(self.var_tpl_thr.get())
             f.roi_top = float(self.var_roi_top.get()) / 100.0
@@ -788,6 +912,7 @@ class App:
             w.double_click = self.var_double.get()
             w.restore_mouse = self.var_restore.get()
             w.sound = self.var_sound.get()
+            w.shots = self.var_shots.get()
         except ValueError:
             self.log("Aviso: algún parámetro no es un número válido; "
                      "se mantienen los anteriores.")
@@ -818,7 +943,7 @@ class App:
     # ---------- cuentagotas / plantilla ----------
     def pick_color(self):
         try:
-            h, s, v, b, g, r = self.finder.pick_color_at_cursor()
+            h, s, v, b, g, r, inestable = self.finder.pick_color_at_cursor()
         except Exception as exc:
             self.log(f"Error leyendo el color: {exc}")
             return
@@ -834,6 +959,11 @@ class App:
         self.log(f"Color capturado: RGB({r},{g},{b}) → tono {h}, "
                  f"saturación {s}, brillo {v}. Rango: tono {h}±12, "
                  f"sat≥{max(25, s - 60)}, brillo≥{max(50, v - 60)}.")
+        if inestable:
+            self.log("Ojo: el color parpadeaba mientras lo leía. Es el brillo "
+                     "de un objeto encantado; he usado el color de debajo. "
+                     "Deja 'Fotogramas unidos' en 3 o más y NO uses el modo "
+                     "Imagen de referencia con objetos encantados.")
         self.log("Pulsa 'Probar detección' para comprobarlo sin clicar.")
         beep(True)
 
@@ -1028,6 +1158,8 @@ class App:
                     self.log("Hay más de un candidato: si el correcto no es "
                              "el nº 1, acota la zona de búsqueda (% alto), "
                              "aprieta la tolerancia o usa el modo Imagen.")
+            for r in self.finder.rejects[:8]:
+                self.log("   · " + r)
             self.log(f"Imagen de depuración: {DEBUG_IMG}")
         threading.Thread(target=_do, daemon=True).start()
 
@@ -1037,6 +1169,18 @@ class App:
             return
         try:
             os.startfile(DEBUG_IMG)
+        except Exception as exc:
+            self.log(f"No se pudo abrir: {exc}")
+
+    def open_shot(self):
+        shots = [SHOT_PATH % i for i in (1, 2, 3)]
+        shots = [p for p in shots if os.path.exists(p)]
+        if not shots:
+            self.log("Aún no hay capturas de clics.")
+            return
+        ultima = max(shots, key=os.path.getmtime)
+        try:
+            os.startfile(ultima)
         except Exception as exc:
             self.log(f"No se pudo abrir: {exc}")
 
@@ -1067,6 +1211,7 @@ class App:
             "area": self.var_area, "area_max": self.var_area_max,
             "tpl_size": self.var_tpl_size, "tpl_thr": self.var_tpl_thr,
             "roi_top": self.var_roi_top, "roi_bottom": self.var_roi_bottom,
+            "max_side": self.var_max_side, "frames": self.var_frames,
             "interval": self.var_interval, "cooldown": self.var_cooldown,
             "repeats": self.var_repeats, "speed": self.var_speed,
             "sched_min": self.var_sched_min,
@@ -1085,6 +1230,8 @@ class App:
         self.var_double.set(cfg.get("double", False))
         self.var_restore.set(cfg.get("restore", True))
         self.var_sound.set(cfg.get("sound", True))
+        self.var_on_gui.set(cfg.get("on_gui", True))
+        self.var_shots.set(cfg.get("shots", True))
         self.var_topmost.set(cfg.get("topmost", False))
         self.var_logfile.set(cfg.get("logfile", True))
         self._apply_topmost()
@@ -1095,6 +1242,8 @@ class App:
         cfg["double"] = self.var_double.get()
         cfg["restore"] = self.var_restore.get()
         cfg["sound"] = self.var_sound.get()
+        cfg["on_gui"] = self.var_on_gui.get()
+        cfg["shots"] = self.var_shots.get()
         cfg["topmost"] = self.var_topmost.get()
         cfg["logfile"] = self.var_logfile.get()
         try:
