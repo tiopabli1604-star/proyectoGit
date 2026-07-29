@@ -2,5 +2,11 @@ build/
 dist/
 __pycache__/
 *.pyc
+*.spec
+golem_config.json
+golem_log.txt
+golem_debug.png
+golem_plantilla.png
 macropro_config.json
+debug_deteccion.png
 *.macro.json
