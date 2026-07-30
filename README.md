@@ -310,7 +310,9 @@ Una por línea. Todo lo que vaya tras `#` es un comentario.
 | `desaparecer <objetivo> [segundos]` | Espera a que deje de verse. |
 | `clic [doble\|derecho\|medio]` | Clica donde se vio el último objetivo. |
 | `esperar <segundos>` | Pausa. |
-| `tecla <nombre>` | Pulsa una tecla: `esc`, `intro`, `espacio`, `f`, `1`… |
+| `tecla <nombre>` | Pulsa una tecla: `esc`, `intro`, `espacio`, `f`, `1`… o una combinación: `shift+1`, `ctrl+f`. |
+| `esperar_cambio <objetivo> <segundos>` | Espera a que algo se mueva en esa zona. |
+| `esperar_sonido <segundos>` | Espera a que suene algo por los altavoces. |
 | `escribir <texto>` | Teclea el texto tal cual. |
 | `macro <archivo.macro.json>` | Reproduce una macro grabada y espera a que acabe. |
 | `pitar` | Un pitido, para saber por dónde va sin mirar. |
@@ -345,6 +347,32 @@ mantener w 2
 girar -180 0
 repetir 10
 ```
+
+### Combinaciones de teclas
+
+`tecla shift+1` pulsa las dos a la vez: las de delante se quedan pulsadas
+mientras se pulsa y suelta la última, y se sueltan en orden inverso, que es como
+funciona un atajo de verdad. Admite hasta cuatro (`ctrl+shift+f`), y valen los
+nombres en castellano (`mayus+3`).
+
+### Cuando lo que hay que detectar no es un color
+
+Dos sensores más, para lo que aparece y desaparece en un instante:
+
+- **`esperar_cambio <objetivo> <segundos>`** mira la zona de ese objetivo y sigue
+  en cuanto algo se mueve ahí, sin saber de qué color es ni qué forma tiene. Unas
+  20 comprobaciones por segundo.
+- **`esperar_sonido <segundos>`** escucha lo que sale por los altavoces. Para un
+  aviso que suena siempre igual es más fiable que la vista, porque no depende de
+  dónde estés mirando. Se captura del propio altavoz, sin micrófono y sin tocar
+  nada del sistema.
+
+Los dos calculan el umbral solos, comparando con lo que venía habiendo: así una
+zona con algo animado de fondo, o un volumen más alto, no disparan por sí mismos.
+Y ninguno juzga durante las primeras décimas, mientras mide ese fondo.
+
+Los dos aceptan `si_falla` como `buscar`, así que puedes decidir qué hacer cuando
+el plazo se agota.
 
 ### Cuando el juego te suelta las teclas
 
@@ -479,6 +507,17 @@ Tres cosas para dejarlo solo mucho rato:
   mientras no estabas.
 
 Pon a `0` lo que no quieras usar.
+
+### Comprobar todo
+
+El botón **Comprobar todo** deja por escrito, de una vez, qué ve y qué oye: dónde
+guarda los archivos, la resolución, qué ventana hay delante y si actuaría con
+ella, el modo y la zona en píxeles, los objetivos guardados, cuánto tarda un
+escaneo y cuántos candidatos encuentra ahora, si puede leer el ratón por raw input
+y si puede escuchar el audio, y si el guion está bien escrito.
+
+Es lo primero que hay que mirar cuando algo no va: convierte «no funciona» en algo
+concreto sin gastar una tarde.
 
 ### ¿Ha servido el clic?
 

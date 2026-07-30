@@ -1206,6 +1206,21 @@ def resolver_tecla(nombre):
         raise ValueError(f"no conozco la tecla '{nombre}'")
 
 
+def resolver_combo(texto):
+    """'shift+1' -> [Key.shift, '1']. Una sola tecla también vale.
+
+    Las de delante se quedan pulsadas mientras se pulsa y suelta la última, y
+    se sueltan al revés de como se pulsaron, que es como funciona un atajo de
+    teclado de verdad.
+    """
+    partes = [p for p in texto.replace("++", "+plus").split("+") if p != ""]
+    if not partes:
+        raise ValueError(f"'{texto}' no es ninguna tecla")
+    if len(partes) > 4:
+        raise ValueError(f"'{texto}' junta demasiadas teclas")
+    return [resolver_tecla("+" if p == "plus" else p) for p in partes]
+
+
 def turn_camera(dx, dy, paso_max=15, gap=0.008, espera=None):
     """Gira la cámara repartiendo el desplazamiento en varios envíos.
 
@@ -1237,6 +1252,156 @@ def turn_camera(dx, dy, paso_max=15, gap=0.008, espera=None):
             else:
                 time.sleep(gap)
     return hecho_x, hecho_y
+
+
+class ZoneChange:
+    """Mide cuánto cambia la zona de un objetivo entre fotogramas.
+
+    Es el sensor para lo que aparece y desaparece en un instante, donde buscar
+    un color no llega: no hace falta saber de qué color es ni qué forma tiene,
+    solo que ahí ha pasado algo. Trabaja en gris y a 96x54, así que un escaneo
+    cuesta muy poco y se puede repetir muchas veces por segundo.
+    """
+
+    def __init__(self, finder, umbral_min=1.0, factor=3.0, memoria=20,
+                 minimo_muestras=4):
+        self.finder = finder
+        # Antes de tener fondo medido no se puede juzgar: en una zona con algo
+        # animado, el primer dato compararía contra el suelo y dispararía al
+        # instante. Con 4 muestras a 20 por segundo son 0.2 s de calentamiento.
+        self.minimo_muestras = minimo_muestras
+        # Un umbral fijo no sirve: el cambio medio se diluye con el tamaño de la
+        # zona (un objeto pequeño que aparece en una zona grande mueve la media
+        # muy poco) y sube si la zona tiene algo animado de fondo. Así que se
+        # compara con lo que venía habiendo, más un suelo absoluto.
+        self.umbral_min = umbral_min
+        self.factor = factor
+        self.memoria = memoria
+        self.reset()
+
+    def reset(self):
+        self.prev = None
+        self.fondo = []
+
+    def umbral(self):
+        if not self.fondo:
+            return self.umbral_min
+        return max(self.umbral_min, float(np.median(self.fondo)) * self.factor)
+
+    def paso(self):
+        """Devuelve (disparo, cambio, umbral). El 1er fotograma no dispara."""
+        bgr, _mon = self.finder.grab_screen()
+        band, _x, _y = self.finder._band(bgr)
+        if band.size == 0:
+            band = bgr
+        peq = cv2.resize(band, (96, 54), interpolation=cv2.INTER_AREA)
+        g = cv2.cvtColor(peq, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        if self.prev is None:
+            self.prev = g
+            return False, None, self.umbral()
+        cambio = float(np.mean(np.abs(g - self.prev)))
+        self.prev = g
+        umbral = self.umbral()          # con el fondo de antes de este dato
+        listo = len(self.fondo) >= self.minimo_muestras
+        self.fondo.append(cambio)
+        if len(self.fondo) > self.memoria:
+            self.fondo.pop(0)
+        return (listo and cambio >= umbral), cambio, umbral
+
+
+# El audio es opcional: si falla la librería, todo lo demás sigue funcionando y
+# solo se pierden las instrucciones de sonido.
+try:
+    import soundcard as _sc
+except Exception:
+    _sc = None
+
+
+class SoundWatch:
+    """Escucha lo que sale por los altavoces y mide el nivel.
+
+    Para un aviso que suena siempre igual —el picado de la caña, una campana—
+    el oído es más fiable que la vista: no depende de dónde mires ni de que se
+    vea bien. Se captura por 'loopback' del altavoz, así que oye el juego sin
+    micrófono y sin tocar nada del sistema.
+
+    Guarda el nivel (RMS) de cada bloque en una ventana corta, y da por 'golpe'
+    cuando el nivel de ahora se sale claramente de lo que venía habiendo: así el
+    umbral se ajusta al volumen que tengas puesto.
+    """
+
+    def __init__(self, factor=3.0, minimo=0.01, memoria=40):
+        self.factor = factor        # cuántas veces por encima del fondo
+        self.minimo = minimo        # nivel mínimo para no disparar con ruido
+        self.memoria = memoria      # bloques de fondo que se recuerdan
+        self.nivel = 0.0
+        self.fondo = 0.0
+        self.error = None
+        self.activo = False
+        self._hist = []
+        self._thread = None
+        self._stop = threading.Event()
+        self._golpe = threading.Event()
+
+    @staticmethod
+    def disponible():
+        return _sc is not None
+
+    def start(self, timeout=3.0):
+        if _sc is None:
+            self.error = ("no está la librería de audio (soundcard); "
+                          "reinstala el programa")
+            return False
+        self._stop.clear()
+        self._golpe.clear()
+        self.error = None
+        self._hist = []
+        listo = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(listo,),
+                                        daemon=True)
+        self._thread.start()
+        listo.wait(timeout)
+        return self.activo
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        self.activo = False
+
+    def _run(self, listo):
+        try:
+            alt = _sc.default_speaker()
+            mic = _sc.get_microphone(alt.name, include_loopback=True)
+            with mic.recorder(samplerate=44100, channels=2,
+                              blocksize=1024) as rec:
+                self.activo = True
+                listo.set()
+                while not self._stop.is_set():
+                    datos = np.asarray(rec.record(numframes=2048))
+                    if datos.size == 0:
+                        continue
+                    mono = datos.mean(axis=1)
+                    self.nivel = float(np.sqrt(np.mean(mono ** 2)))
+                    if self._hist:
+                        self.fondo = float(np.median(self._hist))
+                        if (self.nivel > self.minimo
+                                and self.nivel > self.fondo * self.factor):
+                            self._golpe.set()
+                    self._hist.append(self.nivel)
+                    if len(self._hist) > self.memoria:
+                        self._hist.pop(0)
+        except Exception as exc:
+            self.error = exc
+            listo.set()
+        finally:
+            self.activo = False
+
+    def limpiar(self):
+        self._golpe.clear()
+
+    def hubo_golpe(self):
+        return self._golpe.is_set()
 
 
 class StuckDetector:
@@ -1378,6 +1543,8 @@ class Script:
         self.stuck = StuckDetector()
         self.stuck_intervalo = 0.35     # s entre fotogramas al vigilar
         self.ventana_req = ""           # solo actuar si el título la contiene
+        self.cambio_intervalo = 0.05    # s entre fotogramas: ~20 por segundo
+        self.sonido = None              # SoundWatch, solo si se usa
 
     # ---------- análisis ----------
     @classmethod
@@ -1464,6 +1631,44 @@ class Script:
                                        f"un límite de segundos, porque sin él "
                                        f"espera para siempre")
 
+            elif op in ("esperar_cambio", "esperar_sonido"):
+                p["objetivo"] = None
+                idx = 0
+                if op == "esperar_cambio":
+                    if not args:
+                        errores.append(f"línea {nlin}: 'esperar_cambio' "
+                                       f"necesita el objetivo cuya zona hay "
+                                       f"que mirar")
+                        continue
+                    p["objetivo"] = args[0]
+                    if args[0] not in targets:
+                        disp = ", ".join(sorted(targets)) or "ninguno todavía"
+                        errores.append(f"línea {nlin}: no hay un objetivo "
+                                       f"llamado '{args[0]}' "
+                                       f"(guardados: {disp})")
+                    idx = 1
+                resto = list(args[idx:])
+                p["timeout"] = None
+                p["politica"] = ("parar", None)
+                if resto and resto[0].lower() != "si_falla":
+                    try:
+                        p["timeout"] = float(resto.pop(0).replace(",", "."))
+                        if p["timeout"] <= 0:
+                            raise ValueError
+                    except ValueError:
+                        errores.append(f"línea {nlin}: tras '{op}' van los "
+                                       f"segundos que como mucho va a esperar")
+                if p["timeout"] is None:
+                    errores.append(f"línea {nlin}: '{op}' necesita un límite de "
+                                   f"segundos, que si no se queda esperando "
+                                   f"para siempre")
+                if resto:
+                    pol, err = cls._politica(resto, nlin, "si_falla")
+                    if err:
+                        errores.append(err)
+                    else:
+                        p["politica"] = pol
+
             elif op == "clic":
                 p["boton"] = "left"
                 p["doble"] = False
@@ -1495,10 +1700,11 @@ class Script:
             elif op in ("tecla", "pulsar"):
                 p["op"] = "tecla"
                 if len(args) != 1:
-                    errores.append(f"línea {nlin}: '{op}' necesita una tecla")
+                    errores.append(f"línea {nlin}: '{op}' necesita una tecla "
+                                   f"(o una combinación, como shift+1)")
                 else:
                     try:
-                        resolver_tecla(args[0])
+                        resolver_combo(args[0])
                         p["tecla"] = args[0]
                     except ValueError as exc:
                         errores.append(f"línea {nlin}: {exc}")
@@ -1611,7 +1817,8 @@ class Script:
                 continue
 
             # ¿este paso hace perder tiempo? Es lo que frena un bucle
-            p["bloquea"] = (op in ("buscar", "desaparecer", "esperar", "macro")
+            p["bloquea"] = (op in ("buscar", "desaparecer", "esperar", "macro",
+                                   "esperar_cambio", "esperar_sonido")
                             or (op in ("mantener", "mantener_clic")
                                 and p.get("segundos")))
             pasos.append(p)
@@ -1624,7 +1831,8 @@ class Script:
             destinos = []
             if p["op"] == "ir":
                 destinos.append(p.get("destino"))
-            if p["op"] in ("buscar", "desaparecer") and \
+            if p["op"] in ("buscar", "desaparecer", "esperar_cambio",
+                           "esperar_sonido") and \
                     p.get("politica", ("parar",))[0] == "ir":
                 destinos.append(p["politica"][1])
             if p.get("atasco") and p["atasco"][0] == "ir":
@@ -1671,6 +1879,15 @@ class Script:
             elif op == "desaparecer":
                 t = (f"hasta {p['timeout']:g} s" if p["timeout"] else "sin límite")
                 txt = f"espera a que '{p['objetivo']}' desaparezca ({t})"
+            elif op in ("esperar_cambio", "esperar_sonido"):
+                pol = p["politica"]
+                fin = {"parar": "para el guion", "seguir": "sigue igual",
+                       "repetir": "vuelve al paso 1",
+                       "ir": f"salta al paso {pol[1]}"}[pol[0]]
+                qué = (f"algo cambie en la zona de '{p['objetivo']}'"
+                       if op == "esperar_cambio" else "suene algo")
+                txt = (f"espera a que {qué} (hasta {p['timeout']:g} s); "
+                       f"si no pasa, {fin}")
             elif op == "clic":
                 q = "doble clic" if p["doble"] else "clic"
                 b = {"left": "", "right": " derecho", "middle": " central"}[p["boton"]]
@@ -1678,7 +1895,9 @@ class Script:
             elif op == "esperar":
                 txt = f"espera {p['segundos']:g} s"
             elif op == "tecla":
-                txt = f"pulsa la tecla {p['tecla']}"
+                txt = (f"pulsa {p['tecla'].replace('+', ' + ')} a la vez"
+                       if "+" in p["tecla"].strip("+")
+                       else f"pulsa la tecla {p['tecla']}")
             elif op == "girar":
                 lados = ("nada" if not p["dx"] else
                          f"{abs(p['dx'])} a la {'derecha' if p['dx'] > 0 else 'izquierda'}")
@@ -1754,6 +1973,54 @@ class Script:
     def _esperar(self, seg):
         """Como sleep, pero se corta al parar."""
         return not self._stop.wait(max(0.0, seg))
+
+    def _esperar_cambio(self, paso, n):
+        """Espera a que la zona del objetivo cambie. -> (ok, detalle)."""
+        self.finder.apply(self.targets[paso["objetivo"]])
+        det = ZoneChange(self.finder)
+        t0 = time.perf_counter()
+        mayor = 0.0
+        ultimo_umbral = det.umbral()
+        while time.perf_counter() - t0 < paso["timeout"]:
+            if not self._esperar(self.cambio_intervalo):
+                return False, "espera de cambio cortada"
+            try:
+                disparo, c, umbral = det.paso()
+            except Exception as exc:
+                return False, f"no pude mirar la zona: {exc}"
+            ultimo_umbral = umbral
+            if c is None:
+                continue
+            mayor = max(mayor, c)
+            if disparo:
+                return True, (f"algo ha cambiado en la zona de "
+                              f"'{paso['objetivo']}' (cambio {c:.2f}, hacía "
+                              f"falta {umbral:.2f}) tras "
+                              f"{time.perf_counter() - t0:.2f} s")
+        return False, (f"nada cambió en la zona de '{paso['objetivo']}' en "
+                       f"{paso['timeout']:g} s (lo más que cambió fue "
+                       f"{mayor:.2f}, hacía falta {ultimo_umbral:.2f})")
+
+    def _esperar_sonido(self, paso, n):
+        """Espera un golpe de sonido por los altavoces. -> (ok, detalle)."""
+        if self.sonido is None:
+            self.sonido = SoundWatch()
+        if not self.sonido.activo:
+            if not self.sonido.start():
+                return False, (f"no pude escuchar el audio "
+                               f"({self.sonido.error})")
+        self.sonido.limpiar()
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < paso["timeout"]:
+            if not self._esperar(0.05):
+                return False, "espera de sonido cortada"
+            if self.sonido.hubo_golpe():
+                return True, (f"he oído algo (nivel {self.sonido.nivel:.4f} "
+                              f"sobre un fondo de {self.sonido.fondo:.4f}) tras "
+                              f"{time.perf_counter() - t0:.2f} s")
+        return False, (f"no oí nada en {paso['timeout']:g} s "
+                       f"(nivel {self.sonido.nivel:.4f}, fondo "
+                       f"{self.sonido.fondo:.4f})")
 
     def _avanzar_vigilando(self, paso, n):
         """Mantiene la tecla mirando si la pantalla deja de cambiar.
@@ -1939,6 +2206,23 @@ class Script:
                         i = (0 if pol == "repetir"
                              else dest - 1 if pol == "ir" else i + 1)
 
+                elif op in ("esperar_cambio", "esperar_sonido"):
+                    ok, detalle = (self._esperar_cambio(paso, n)
+                                   if op == "esperar_cambio"
+                                   else self._esperar_sonido(paso, n))
+                    if self._stop.is_set():
+                        break
+                    if ok:
+                        self.log(f"{n}. {detalle}")
+                        i += 1
+                    else:
+                        pol, dest = paso["politica"]
+                        self.log(f"{n}. {detalle} → {pol}")
+                        if pol == "parar":
+                            break
+                        i = (0 if pol == "repetir"
+                             else dest - 1 if pol == "ir" else i + 1)
+
                 elif op == "clic":
                     if self.last_pos is None:
                         self.log(f"{n}. no hay ninguna posición donde clicar; "
@@ -1981,10 +2265,18 @@ class Script:
                     i += 1
 
                 elif op == "tecla":
-                    k = resolver_tecla(paso["tecla"])
-                    self.keyboard.press(k)
+                    combo = resolver_combo(paso["tecla"])
+                    # las de delante se mantienen mientras se pulsa la última,
+                    # y se sueltan en orden inverso: un atajo de verdad
+                    for k in combo[:-1]:
+                        self.keyboard.press(k)
+                        time.sleep(0.03)
+                    self.keyboard.press(combo[-1])
                     time.sleep(0.05)
-                    self.keyboard.release(k)
+                    self.keyboard.release(combo[-1])
+                    for k in reversed(combo[:-1]):
+                        time.sleep(0.03)
+                        self.keyboard.release(k)
                     self.log(f"{n}. tecla {paso['tecla']}")
                     i += 1
 
@@ -2105,6 +2397,8 @@ class Script:
         except Exception as exc:
             self.log(f"El guion se ha cortado por un error: {exc}")
         finally:
+            if self.sonido is not None:
+                self.sonido.stop()
             sueltos = self._soltar_todo()
             if sueltos:
                 self.log("Suelto lo que quedaba pulsado: "
@@ -2390,6 +2684,8 @@ class App:
             side="left", padx=4)
         ttk.Button(rs1, text="Usar la de ahora",
                    command=self.usar_ventana_actual).pack(side="left", padx=4)
+        ttk.Button(rs1, text="Comprobar todo",
+                   command=self.diagnostico).pack(side="left", padx=4)
 
         rs2 = ttk.Frame(fs)
         rs2.pack(fill="x", **pad)
@@ -2667,10 +2963,16 @@ class App:
                   "   buscar <objetivo> [segundos] [si_falla parar|seguir|"
                   "repetir|ir <nº>]",
                   "   desaparecer <objetivo> [segundos]",
+                  "   esperar_cambio <objetivo> <segundos> [si_falla …]  ← algo "
+                  "se mueve en esa zona",
+                  "   esperar_sonido <segundos> [si_falla …]  ← suena algo por "
+                  "los altavoces",
                   "   clic [doble|derecho|medio]   ← donde se vio el último "
                   "objetivo",
                   "   esperar <segundos>",
                   "   tecla <nombre>               ← esc, intro, espacio, f, 1…",
+                  "        también combinaciones: shift+1, ctrl+f, "
+                  "ctrl+shift+intro",
                   "   escribir <texto>",
                   "   macro <archivo.macro.json>",
                   "   pitar",
@@ -2976,6 +3278,122 @@ class App:
                 continue
             self.log("Repetición programada: lanzando la macro.")
             self.root.after(0, self.toggle_play)
+
+    def diagnostico(self):
+        """Comprueba de una vez todo lo que puede fallar.
+
+        Existe para que 'no funciona' se convierta en algo concreto sin gastar
+        una tarde de idas y venidas: en un solo botón queda por escrito qué ve,
+        qué oye, dónde guarda y cuánto tarda.
+        """
+        self._apply_settings()
+        # Todo lo que venga de la interfaz se lee AQUÍ, en el hilo de la
+        # ventana: dentro del hilo, un .get() de una variable de Tkinter suelta
+        # "main thread is not in main loop".
+        req = self.var_ventana.get().strip()
+        texto_guion = self.txt_script.get("1.0", "end")
+
+        def _do():
+            L = self.log
+            L("=" * 52)
+            L("COMPROBACIÓN GENERAL")
+            L(f"· Archivos en: {APP_DIR}")
+            if DATA_MOTIVO:
+                L(f"    OJO: {DATA_MOTIVO}. Copia el exe a una carpeta de "
+                  f"verdad.")
+            else:
+                L("    bien: es una carpeta permanente.")
+            try:
+                with mss.mss() as sct:
+                    mon = sct.monitors[1]
+                L(f"· Pantalla: {mon['width']}x{mon['height']} px desde "
+                  f"({mon['left']}, {mon['top']})")
+            except Exception as exc:
+                L(f"· Pantalla: no pude consultarla ({exc})")
+
+            t = ventana_activa()
+            L(f"· Ventana de delante: «{t}»")
+            if not req:
+                L("    sin exigencia de ventana: actuará esté quien esté "
+                  "delante. Pon el juego y pulsa 'Usar la de ahora'.")
+            elif req.lower() in t.lower():
+                L(f"    bien: contiene «{req}», así que actuaría.")
+            else:
+                L(f"    ahora NO actuaría: se exige «{req}». Es lo normal si "
+                  f"tienes delante esta ventana y no el juego.")
+
+            f = self.finder
+            nombres = {"unico": "lo único con color",
+                       "color": "un color concreto",
+                       "plantilla": "imagen de referencia"}
+            L(f"· Modo de búsqueda: {nombres.get(f.mode, f.mode)}")
+            sin_zona = (f.roi_left, f.roi_right, f.roi_top,
+                        f.roi_bottom) == (0.0, 1.0, 0.0, 1.0)
+            if sin_zona:
+                L("    zona: TODA la pantalla. En modo 'lo único con color' "
+                  "eso no vale para un juego: marca la zona con F2.")
+            else:
+                try:
+                    with mss.mss() as sct:
+                        m = sct.monitors[1]
+                    L(f"    zona: "
+                      f"{int((f.roi_right - f.roi_left) * m['width'])}x"
+                      f"{int((f.roi_bottom - f.roi_top) * m['height'])} px "
+                      f"desde ({int(f.roi_left * m['width'])}, "
+                      f"{int(f.roi_top * m['height'])})")
+                except Exception:
+                    pass
+            L(f"· Objetivos guardados: "
+              + (", ".join(sorted(self.targets)) if self.targets
+                 else "ninguno todavía (guárdalos en la pestaña Guion)"))
+
+            try:
+                t0 = time.perf_counter()
+                n = len(f.candidates())
+                ms = (time.perf_counter() - t0) * 1000
+                espera = max(0, int(f.frames) - 1) * f.frame_gap * 1000
+                L(f"· Un escaneo tarda {ms:.0f} ms y ahora mismo encuentra "
+                  f"{n} candidato(s)")
+                if espera > 0:
+                    L(f"    de esos, {espera:.0f} ms son la espera a propósito "
+                      f"entre los {int(f.frames)} fotogramas que une; "
+                      f"el análisis en sí cuesta {ms - espera:.0f} ms")
+            except Exception as exc:
+                L(f"· Escaneo: falló ({exc})")
+
+            L("· Raw input del ratón (para el movimiento relativo):")
+            lis = RawMouseListener(lambda dx, dy: None)
+            if lis.start():
+                lis.stop()
+                L("    bien: se puede grabar el movimiento relativo.")
+            else:
+                L(f"    NO disponible ({lis.error}). El movimiento relativo no "
+                  f"se podrá grabar.")
+
+            L("· Audio (para 'esperar_sonido'):")
+            if not SoundWatch.disponible():
+                L("    no está la librería de audio.")
+            else:
+                sw = SoundWatch()
+                if sw.start():
+                    time.sleep(1.0)
+                    L(f"    bien: nivel ahora {sw.nivel:.4f} (con el juego "
+                      f"sonando debería subir claramente).")
+                    sw.stop()
+                else:
+                    L(f"    NO disponible ({sw.error}).")
+
+            if texto_guion.strip():
+                pasos, errs = Script.parse(texto_guion, self.targets)
+                if errs:
+                    L(f"· Guion: {len(errs)} problema(s). El primero: {errs[0]}")
+                else:
+                    L(f"· Guion: bien, {len(pasos)} paso(s).")
+            else:
+                L("· Guion: vacío.")
+            L("=" * 52)
+            beep(True)
+        threading.Thread(target=_do, daemon=True).start()
 
     def usar_ventana_actual(self):
         t = ventana_activa()
