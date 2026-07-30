@@ -1320,8 +1320,125 @@ def localizar_ancla(ancla):
     return (int(loc[0]), int(loc[1])), float(mx)
 
 
+def _calibrar_con_la_vista(mover, espera, calib=60):
+    """Mide unidades de ratón por píxel usando la vista de ahora, sin ancla.
+
+    Hace falta para poder barrer: sin saber cuánto gira la cámara por unidad de
+    ratón no se puede dar un paso de "media pantalla", y sin eso el barrido es a
+    ciegas. Se usa un trozo de la vista actual como referencia temporal, que
+    para esto vale igual que el ancla.
+    """
+    def parche_actual():
+        bgr, _mon = Finder.grab_screen()
+        h, w = bgr.shape[:2]
+        lw, lh = max(48, int(w * 0.25)), max(48, int(h * 0.25))
+        x0, y0 = (w - lw) // 2, (h - lh) // 2
+        return np.ascontiguousarray(bgr[y0:y0 + lh, x0:x0 + lw]), (x0, y0), (w, h)
+
+    parche, pos, (w, h) = parche_actual()
+    factores = {}
+    for eje in ("x", "y"):
+        logrado = False
+        ultimo = "no lo he podido medir"
+        # Se prueban los dos sentidos: si el personaje está mirando al suelo del
+        # todo, el juego no le deja bajar más y girar hacia abajo mide 0. Eso no
+        # es que el ratón no esté capturado, es que se ha topado con el límite.
+        for signo in (1, -1):
+            d = calib * signo
+            mover(d if eje == "x" else 0, 0 if eje == "x" else d)
+            time.sleep(espera)
+            loc, score = localizar_ancla(parche)
+            if loc is not None and score >= 0.5:
+                desp = (loc[0] - pos[0]) if eje == "x" else (loc[1] - pos[1])
+                if abs(desp) >= 3:
+                    factores[eje] = d / float(desp)
+                    logrado = True
+                    parche, pos, _ = parche_actual()
+                    break
+                ultimo = (f"he girado {abs(d)} y la vista no se ha movido "
+                          f"({desp} px en {eje})")
+            else:
+                ultimo = (f"al girar en {eje} he perdido la referencia "
+                          f"(parecido {score:.2f})")
+            parche, pos, _ = parche_actual()   # referencia nueva para reintentar
+        if not logrado:
+            return None, None, (f"no consigo medir cuánto gira la cámara: "
+                                f"{ultimo}. ¿Está el juego delante y con el "
+                                f"ratón capturado?")
+    return factores, (w, h), ""
+
+
+def buscar_ancla_girando(ancla, parecido_min, mover, espera, log,
+                         pasos=10, paso_frac=0.55,
+                         niveles=(-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5),
+                         calib=60):
+    """Gira la cámara buscando la vista de la grabación. -> (loc, score, error).
+
+    Barre en horizontal a varias alturas, porque si el personaje está mirando al
+    suelo o al cielo por mucho que gire no va a ver nunca la referencia.
+
+    Las dos cosas que hacen que no se cuele el ancla por un hueco:
+
+      · en horizontal cada paso avanza algo más de media pantalla, y con 10
+        pasos se da algo más de una vuelta completa (con un campo de visión
+        normal, una vuelta son unas cinco pantallas);
+      · en vertical las alturas van de media en media pantalla, porque el ancla
+        solo mide un 30% de alto: si fueran más separadas podría quedarse justo
+        entre dos.
+
+    Y las alturas se recorren de abajo arriba, sin ir y venir: los saltos son
+    más pequeños y no se lía con el tope de mirar al cielo o al suelo.
+    """
+    factores, medidas, err = _calibrar_con_la_vista(mover, espera, calib)
+    if factores is None:
+        return None, 0.0, err
+    w, h = medidas
+    paso_x = int(round(w * paso_frac * factores["x"]))
+    total = pasos * len(niveles)
+    log(f"   barriendo: {pasos} pasos de ~{paso_frac:.0%} de pantalla en "
+        f"{len(niveles)} alturas ({total} comprobaciones, unos "
+        f"{total * (espera + 0.08):.0f} s). Girando…")
+
+    # Si el ancla asoma medio fuera de la pantalla, matchTemplate la "encuentra"
+    # pegada al borde y devuelve una posición falsa. Se exige que quepa entera
+    # con margen: el siguiente paso del barrido la traerá hacia dentro.
+    margen = 8
+    ah, aw = ancla.shape[:2]
+
+    def entera(loc):
+        return (loc is not None and margen <= loc[0] <= w - aw - margen
+                and margen <= loc[1] <= h - ah - margen)
+
+    mejor = (None, 0.0)
+    altura_actual = 0.0
+    for nivel in niveles:
+        # colocarse en esa altura (relativa a la de partida)
+        delta = nivel - altura_actual
+        if delta:
+            mover(0, int(round(h * delta * factores["y"])))
+            altura_actual = nivel
+            time.sleep(espera)
+        for i in range(pasos):
+            loc, score = localizar_ancla(ancla)
+            if score > mejor[1]:
+                mejor = (loc, score)
+            if score >= parecido_min and entera(loc):
+                log(f"   encontrada girando: parecido {score:.2f} "
+                    f"(altura {nivel:+.2f}, paso {i})")
+                return loc, score, factores
+            mover(paso_x, 0)
+            time.sleep(espera)
+    return None, mejor[1], (f"he dado la vuelta mirando en {len(niveles)} "
+                            f"alturas y no he "
+                            f"reconocido la vista en ningún sitio (lo más "
+                            f"parecido fue {mejor[1]:.2f}, hace falta "
+                            f"{parecido_min:.2f}). ¿Es el mismo mundo y el mismo "
+                            f"sitio donde grabaste?")
+
+
 def alinear_camara(ancla, destino, parecido_min=0.55, tolerancia=4,
-                   intentos=8, calib=60, espera=0.18, mover=None, log=None):
+                   intentos=8, calib=60, espera=0.18, mover=None, log=None,
+                   buscar=True, espera_barrido=0.12):
     """Gira la cámara hasta que la vista vuelva a estar como al grabar.
 
     Bucle cerrado: se busca el trozo de referencia, se mira cuántos píxeles está
@@ -1340,29 +1457,42 @@ def alinear_camara(ancla, destino, parecido_min=0.55, tolerancia=4,
         time.sleep(espera)       # que el juego pinte el fotograma nuevo
         return localizar_ancla(ancla)
 
+    ya_calibrado = None
     loc, score = mirar()
     if loc is None or score < parecido_min:
-        return False, (f"no reconozco la vista (parecido {score:.2f}, hace "
-                       f"falta {parecido_min:.2f}). Ponte más o menos donde "
-                       f"estabas al grabar y vuelve a intentarlo.")
+        if not buscar:
+            return False, (f"no reconozco la vista (parecido {score:.2f}, hace "
+                           f"falta {parecido_min:.2f}). Ponte más o menos donde "
+                           f"estabas al grabar y vuelve a intentarlo.")
+        apunta(f"   no reconozco la vista de entrada (parecido {score:.2f}); "
+               f"la busco girando.")
+        # durante el barrido basta con una espera más corta: solo hace falta
+        # reconocerla a grandes rasgos, y el ajuste fino ya espera lo suyo
+        loc, score, extra = buscar_ancla_girando(
+            ancla, parecido_min, mover, min(espera, espera_barrido), apunta,
+            calib=calib)
+        if loc is None:
+            return False, extra
+        # el barrido ya midió la relación píxeles/ratón: se reutiliza en vez de
+        # volver a girar para calibrar, que es cuando se puede perder el ancla
+        ya_calibrado = extra if isinstance(extra, dict) else None
 
     # --- medir cuántas unidades de ratón hace falta por píxel, y en qué signo
-    factores = {}
-    for eje, (dx, dy) in (("x", (calib, 0)), ("y", (0, calib))):
-        antes = loc
-        mover(dx, dy)
+    if ya_calibrado:
+        factores = ya_calibrado
+        apunta(f"   reutilizo la medida del barrido: {factores['x']:+.2f} y "
+               f"{factores['y']:+.2f} unidades por px")
+    else:
+        # una sola implementación de la calibración, la misma que usa el barrido
+        factores, _medidas, err = _calibrar_con_la_vista(mover, espera, calib)
+        if factores is None:
+            return False, err
+        apunta(f"   calibrado: {factores['x']:+.2f} y {factores['y']:+.2f} "
+               f"unidades por px")
         loc, score = mirar()
         if loc is None or score < parecido_min:
-            return False, (f"al girar para calibrar he perdido la referencia "
-                           f"(parecido {score:.2f}). La vista cambia demasiado.")
-        desp = (loc[0] - antes[0]) if eje == "x" else (loc[1] - antes[1])
-        if abs(desp) < 3:
-            return False, (f"he girado {calib} y la vista apenas se ha movido "
-                           f"({desp} px en {eje}). ¿Está el juego delante y con "
-                           f"el ratón capturado?")
-        factores[eje] = calib / float(desp)
-        apunta(f"   calibrado {eje}: {calib} unidades = {desp} px "
-               f"({factores[eje]:+.2f} por px)")
+            return False, (f"al calibrar he perdido de vista la referencia "
+                           f"(parecido {score:.2f}).")
 
     # --- corregir hasta que quede dentro de la tolerancia
     for intento in range(1, intentos + 1):

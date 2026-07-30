@@ -54,20 +54,38 @@ class MundoFalso:
 
     def instalar(self):
         def grab():
-            x = int(np.clip(self.cx, 0, self.mundo.shape[1] - W))
-            y = int(np.clip(self.cy, 0, self.mundo.shape[0] - H))
-            return np.ascontiguousarray(self.mundo[y:y + H, x:x + W]), MON
+            # en horizontal el mundo da la vuelta, como girar sobre uno mismo;
+            # en vertical se topa, como el limite de mirar arriba y abajo
+            mh, mw = self.mundo.shape[:2]
+            x = int(self.cx) % mw
+            y = int(np.clip(self.cy, 0, mh - H))
+            if x + W <= mw:
+                vista = self.mundo[y:y + H, x:x + W]
+            else:
+                vista = np.concatenate(
+                    [self.mundo[y:y + H, x:], self.mundo[y:y + H, :x + W - mw]],
+                    axis=1)
+            return np.ascontiguousarray(vista), MON
         G.Finder.grab_screen = staticmethod(grab)
+
+    def _limitar(self):
+        # el juego CLAVA el angulo en el limite, no acumula por dentro: si estas
+        # mirando al suelo del todo y sigues bajando, no se guarda un "mas
+        # abajo" imaginario, asi que subir un poco mueve la vista al instante
+        tope = self.mundo.shape[0] - H
+        self.cy = float(np.clip(self.cy, 0, tope))
 
     def mover(self, dx, dy):
         """Como turn_camera: mover el raton desplaza la vista."""
         self.movimientos += 1
         self.cx -= self.signo_x * dx * self.sens
         self.cy -= self.signo_y * dy * self.sens
+        self._limitar()
 
     def desviar(self, px, py):
         self.cx += px
         self.cy += py
+        self._limitar()
 
 
 def p_ancla_ida_y_vuelta():
@@ -162,19 +180,60 @@ def p_pocas_correcciones():
     check("con pocos giros en total", usados <= 6, f"{usados} giros")
 
 
-def p_no_reconoce_la_vista():
-    print("--- si mira a otro sitio, se niega y lo explica ---")
+def p_busca_girando():
+    """Lo que pidio el usuario: que no haya que colocar la camara a mano."""
+    print("--- la busca girando si esta mirando a otro lado ---")
+    for nombre, (px, py) in (("media vuelta", (2400, 0)),
+                             ("de espaldas", (4300, 0)),
+                             ("mirando al suelo", (900, 700)),
+                             ("mirando arriba", (1500, -700))):
+        m = MundoFalso()
+        m.instalar()
+        ancla, pos = G.capturar_ancla()
+        m.desviar(px, py)
+        # de entrada no deberia reconocerla
+        _l, s0 = G.localizar_ancla(ancla)
+        ok, detalle = G.alinear_camara(ancla, pos, mover=m.mover, espera=0.0,
+                                       log=lambda _m: None)
+        loc, _s = G.localizar_ancla(ancla)
+        err = (pos[0] - loc[0], pos[1] - loc[1]) if loc else None
+        check(f"{nombre} (parecido inicial {s0:.2f})",
+              ok and err is not None and abs(err[0]) <= 4 and abs(err[1]) <= 4,
+              f"{detalle[:70]} | queda {err}")
+
+
+def p_sin_buscar_se_niega():
+    print("--- con buscar=False se niega, como antes ---")
     m = MundoFalso()
     m.instalar()
     ancla, pos = G.capturar_ancla()
-    # otro mundo completamente distinto
-    m2 = MundoFalso(semilla=99)
-    m2.instalar()
-    ok, detalle = G.alinear_camara(ancla, pos, mover=m2.mover, espera=0.0)
+    m.desviar(2400, 0)
+    ok, detalle = G.alinear_camara(ancla, pos, mover=m.mover, espera=0.0,
+                                   buscar=False)
     check("no alinea", not ok)
     check("y dice que no reconoce la vista", "no reconozco la vista" in detalle,
-          detalle[:80])
-    check("sin haber movido nada", m2.movimientos == 0,
+          detalle[:70])
+    check("sin haber movido nada", m.movimientos == 0,
+          f"{m.movimientos} movimientos")
+
+
+def p_no_esta_en_ningun_sitio():
+    print("--- si el ancla no esta en ningun sitio, lo dice tras buscar ---")
+    m = MundoFalso()
+    m.instalar()
+    ancla, _pos = G.capturar_ancla()
+    # otro mundo completamente distinto: por mucho que gire no la vera
+    m2 = MundoFalso(semilla=99)
+    m2.instalar()
+    ok, detalle = G.alinear_camara(ancla, _pos, mover=m2.mover, espera=0.0,
+                                   log=lambda _m: None)
+    check("no alinea", not ok)
+    check("dice que ha girado y no la ha visto",
+          "no he reconocido la vista" in detalle
+          and "alturas" in detalle, detalle[:90])
+    check("y da el mejor parecido que vio, para poder juzgar",
+          "lo más parecido fue" in detalle, detalle[-70:])
+    check("y ha girado de verdad buscandola", m2.movimientos > 20,
           f"{m2.movimientos} movimientos")
 
 
@@ -188,20 +247,23 @@ def p_camara_que_no_gira():
                                    espera=0.0)
     check("no alinea", not ok)
     check("y sospecha del raton capturado",
-          "apenas se ha movido" in detalle, detalle[:90])
+          "no se ha movido" in detalle and "ratón capturado" in detalle,
+          detalle[:100])
 
 
-def p_desvio_enorme():
-    print("--- un desvio brutal: se rinde con un mensaje util ---")
-    m = MundoFalso(sens=0.5)
-    m.instalar()
-    ancla, pos = G.capturar_ancla()
-    m.desviar(900, 500)          # el ancla ya no esta en la vista
-    ok, detalle = G.alinear_camara(ancla, pos, mover=m.mover, espera=0.0)
-    check("no alinea a ciegas", not ok, detalle[:70])
-    check("y dice algo accionable",
-          "no reconozco la vista" in detalle or "no consigo alinearla" in detalle
-          or "he perdido la referencia" in detalle, detalle[:90])
+def p_camara_lenta_y_rapida():
+    print("--- busca igual con sensibilidad muy baja o muy alta ---")
+    for sens in (0.15, 2.0):
+        m = MundoFalso(sens=sens)
+        m.instalar()
+        ancla, pos = G.capturar_ancla()
+        m.desviar(2200, 0)
+        ok, detalle = G.alinear_camara(ancla, pos, mover=m.mover, espera=0.0,
+                                       log=lambda _m: None)
+        loc, _s = G.localizar_ancla(ancla)
+        err = (pos[0] - loc[0], pos[1] - loc[1]) if loc else None
+        check(f"sensibilidad {sens}", ok and err and abs(err[0]) <= 4,
+              f"{detalle[:60]} | queda {err}")
 
 
 def p_formato_del_archivo():
@@ -235,7 +297,8 @@ def p_formato_del_archivo():
 if __name__ == "__main__":
     for fn in (p_ancla_ida_y_vuelta, p_localizar, p_alinea, p_aprende_el_signo,
                p_aprende_la_sensibilidad, p_pocas_correcciones,
-               p_no_reconoce_la_vista, p_camara_que_no_gira, p_desvio_enorme,
+               p_busca_girando, p_sin_buscar_se_niega, p_no_esta_en_ningun_sitio,
+               p_camara_que_no_gira, p_camara_lenta_y_rapida,
                p_formato_del_archivo):
         try:
             fn()

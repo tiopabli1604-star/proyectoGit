@@ -99,13 +99,29 @@ depende de la sensibilidad que tengas puesta y del campo de visión, así que no
 puede suponer. Y el signo también se aprende, en vez de dar por hecho hacia dónde
 gira la cámara.
 
-- **Si lo consigue**, reproduce. En las pruebas le bastan dos giros de
-  calibración y una corrección.
-- **Si no reconoce la vista** (estás mirando a otro sitio, o el juego no está
-  delante), **no reproduce**, y lo dice. Eso es lo que evita estropear la
-  grabación: mejor no empezar que empezar torcido.
+- **Si reconoce la vista de entrada**, corrige y reproduce. Le bastan dos giros
+  de calibración y una corrección.
+- **Si no la reconoce, la busca girando**, sin que tengas que colocar nada a
+  mano. Da algo más de una vuelta completa a siete alturas distintas —también
+  hace falta buscar en vertical, porque si el personaje está mirando al suelo por
+  mucho que gire no va a ver nunca la referencia—. Son unas 70 comprobaciones,
+  entre 15 y 20 segundos, y el registro te dice por dónde va.
+- **Si tras dar la vuelta no la ha visto en ningún sitio**, se para y te dice cuál
+  fue el parecido máximo que encontró, para que puedas juzgar si es que estás en
+  otro sitio del mundo. No reproduce: mejor no empezar que empezar torcido.
 - **Si giras y la vista no se mueve**, te avisa de que el ratón no parece estar
   capturado por el juego.
+
+Dos detalles que hacen que el barrido no falle. En horizontal cada paso avanza
+algo más de media pantalla, así que hay solape; y en vertical las alturas van de
+media en media pantalla, porque la foto solo mide un 30% de alto y con saltos más
+grandes podría quedarse justo entre dos. Las alturas se recorren de abajo arriba
+sin ir y venir, que así los saltos son pequeños y no se lía con el tope de mirar
+al cielo o al suelo.
+
+Y si estás mirando al suelo del todo, girar más hacia abajo no mueve nada porque
+el juego topa ahí: en ese caso mide la sensibilidad girando hacia el otro lado, en
+vez de creerse que el ratón no está capturado.
 
 El botón **Comprobar alineación** te dice cuánto está desviada ahora mismo, sin
 tocar la cámara ni reproducir. Y la casilla **Alinear la cámara antes de
