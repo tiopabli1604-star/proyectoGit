@@ -1194,6 +1194,76 @@ def turn_camera(dx, dy, paso_max=15, gap=0.008, espera=None):
     return hecho_x, hecho_y
 
 
+class StuckDetector:
+    """Detecta que la vista ha dejado de cambiar mientras se ordena avanzar.
+
+    No sabe nada del juego: solo compara fotogramas seguidos. Si se está
+    mandando andar y la imagen apenas cambia, o hay una pared delante o el
+    personaje se ha quedado colgado en algo.
+
+    El umbral no puede ser fijo, porque cuánto cambia la pantalla al andar
+    depende del juego, del campo de visión y de la resolución. Así que se mide
+    solo: se toma como referencia el percentil 75 de los cambios vistos —el
+    nivel típico de "moviéndose", que aguanta aunque una parte del rato esté
+    atascado— y se considera atasco cuando el cambio baja de una fracción de
+    esa referencia. Hay además un suelo absoluto, para el caso de llegar ya
+    atascado y no tener nunca una referencia alta.
+
+    Se mira solo la parte central de la pantalla: fuera quedan la barra de
+    objetos, el chat y el objeto de la mano, que se mueven por su cuenta y
+    ensuciarían la medida.
+    """
+
+    REGION = (0.20, 0.15, 0.80, 0.70)   # izq, arriba, der, abajo (fracciones)
+
+    def __init__(self, umbral_min=1.5, fraccion=0.25, seguidos=3,
+                 minimo_muestras=4):
+        self.umbral_min = umbral_min
+        self.fraccion = fraccion
+        self.seguidos = seguidos
+        self.minimo_muestras = minimo_muestras
+        self.reset()
+
+    def reset(self):
+        self._prev = None
+        self.cambios = []
+        self.quietos = 0
+
+    @staticmethod
+    def _muestra():
+        bgr, _mon = Finder.grab_screen()
+        h, w = bgr.shape[:2]
+        l, t, r, b = StuckDetector.REGION
+        corte = bgr[int(h * t):int(h * b), int(w * l):int(w * r)]
+        if corte.size == 0:
+            corte = bgr
+        peq = cv2.resize(corte, (160, 90), interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(peq, cv2.COLOR_BGR2GRAY).astype(np.int16)
+
+    def umbral(self):
+        """El nivel por debajo del cual se considera que no pasa nada."""
+        if len(self.cambios) < self.minimo_muestras:
+            return self.umbral_min
+        base = float(np.percentile(self.cambios, 75))
+        return max(self.umbral_min, base * self.fraccion)
+
+    def paso(self):
+        """Toma un fotograma. Devuelve (atascado, cambio, umbral)."""
+        g = self._muestra()
+        if self._prev is None:
+            self._prev = g
+            return False, None, self.umbral()
+        cambio = float(np.mean(np.abs(g - self._prev)))
+        self._prev = g
+        umbral = self.umbral()          # con el historial de antes de este dato
+        self.cambios.append(cambio)
+        if cambio < umbral:
+            self.quietos += 1
+        else:
+            self.quietos = 0
+        return self.quietos >= self.seguidos, cambio, umbral
+
+
 def type_text(kb, texto, tecla_antes=None, intro=True, delay_char=0.02,
               delay_ui=0.30):
     """Teclea un texto como lo haría una persona, no de un volcado.
@@ -1260,8 +1330,34 @@ class Script:
         # personaje sigue andando solo
         self._teclas = set()
         self._botones = set()
+        self.stuck = StuckDetector()
+        self.stuck_intervalo = 0.35     # s entre fotogramas al vigilar
 
     # ---------- análisis ----------
+    @classmethod
+    def _politica(cls, tokens, nlin, palabra):
+        """Analiza '<palabra> parar|seguir|repetir|ir <nº>'.
+
+        Devuelve (politica, error). La usan 'si_falla' de buscar y
+        'si_atascado' de mantener, para que se escriban igual las dos.
+        """
+        if tokens[0].lower() != palabra:
+            return None, f"línea {nlin}: no entiendo '{' '.join(tokens)}'"
+        if len(tokens) < 2 or tokens[1].lower() not in cls.POLITICAS:
+            return None, (f"línea {nlin}: tras '{palabra}' pon parar, seguir, "
+                          f"repetir o 'ir <nº>'")
+        if tokens[1].lower() == "ir":
+            if len(tokens) < 3 or not tokens[2].isdigit():
+                return None, (f"línea {nlin}: '{palabra} ir' necesita un "
+                              f"número de paso")
+            if len(tokens) > 3:
+                return None, (f"línea {nlin}: no entiendo "
+                              f"'{' '.join(tokens[3:])}'")
+            return ("ir", int(tokens[2])), None
+        if len(tokens) > 2:
+            return None, f"línea {nlin}: no entiendo '{' '.join(tokens[2:])}'"
+        return (tokens[1].lower(), None), None
+
     @classmethod
     def parse(cls, texto, targets):
         """Devuelve (pasos, errores). Cada error es un texto ya legible."""
@@ -1312,20 +1408,11 @@ class Script:
                                        f"número de segundos")
                     rest = rest[1:]
                 if rest:
-                    if rest[0].lower() != "si_falla":
-                        errores.append(f"línea {nlin}: no entiendo "
-                                       f"'{' '.join(rest)}'")
-                    elif len(rest) < 2 or rest[1].lower() not in cls.POLITICAS:
-                        errores.append(f"línea {nlin}: tras 'si_falla' pon "
-                                       f"parar, seguir, repetir o 'ir <nº>'")
-                    elif rest[1].lower() == "ir":
-                        if len(rest) < 3 or not rest[2].isdigit():
-                            errores.append(f"línea {nlin}: 'si_falla ir' "
-                                           f"necesita un número de paso")
-                        else:
-                            p["politica"] = ("ir", int(rest[2]))
+                    pol, err = cls._politica(rest, nlin, "si_falla")
+                    if err:
+                        errores.append(err)
                     else:
-                        p["politica"] = (rest[1].lower(), None)
+                        p["politica"] = pol
                     if p["timeout"] is None and p["politica"][0] != "parar":
                         errores.append(f"línea {nlin}: 'si_falla' no sirve sin "
                                        f"un límite de segundos, porque sin él "
@@ -1393,17 +1480,30 @@ class Script:
                     except ValueError as exc:
                         errores.append(f"línea {nlin}: {exc}")
                     p["segundos"] = None
-                    if op == "mantener" and len(args) > 1:
+                    p["atasco"] = None
+                    resto = list(args[1:])
+                    if op == "soltar" and resto:
+                        errores.append(f"línea {nlin}: 'soltar' solo lleva la "
+                                       f"tecla")
+                        resto = []
+                    if resto and resto[0].lower() != "si_atascado":
                         try:
-                            p["segundos"] = float(args[1].replace(",", "."))
+                            p["segundos"] = float(resto.pop(0).replace(",", "."))
                             if p["segundos"] < 0:
                                 raise ValueError
                         except ValueError:
                             errores.append(f"línea {nlin}: '{args[1]}' no es un "
                                            f"número de segundos")
-                    elif op == "soltar" and len(args) > 1:
-                        errores.append(f"línea {nlin}: 'soltar' solo lleva la "
-                                       f"tecla")
+                    if resto:
+                        pol, err = cls._politica(resto, nlin, "si_atascado")
+                        if err:
+                            errores.append(err)
+                        else:
+                            p["atasco"] = pol
+                        if p["segundos"] is None:
+                            errores.append(f"línea {nlin}: 'si_atascado' "
+                                           f"necesita también los segundos que "
+                                           f"como mucho va a estar avanzando")
 
             elif op in ("mantener_clic", "soltar_clic"):
                 p["boton"] = "left"
@@ -1481,6 +1581,8 @@ class Script:
             if p["op"] in ("buscar", "desaparecer") and \
                     p.get("politica", ("parar",))[0] == "ir":
                 destinos.append(p["politica"][1])
+            if p.get("atasco") and p["atasco"][0] == "ir":
+                destinos.append(p["atasco"][1])
             for d in destinos:
                 if d is not None and not (1 <= d <= len(pasos)):
                     errores.append(f"línea {p['lin']}: el paso {d} no existe "
@@ -1538,9 +1640,18 @@ class Script:
                         f"{abs(p['dy'])} {'abajo' if p['dy'] > 0 else 'arriba'}")
                 txt = f"gira la cámara: {lados}, {vert}"
             elif op == "mantener":
-                txt = (f"mantiene {p['tecla']} pulsada {p['segundos']:g} s"
-                       if p["segundos"] else
-                       f"deja {p['tecla']} pulsada (hasta un 'soltar')")
+                if p.get("atasco"):
+                    pol, dest = p["atasco"]
+                    fin = {"parar": "para el guion", "seguir": "sigue igual",
+                           "repetir": "vuelve al paso 1",
+                           "ir": f"salta al paso {dest}"}[pol]
+                    txt = (f"mantiene {p['tecla']} pulsada hasta "
+                           f"{p['segundos']:g} s vigilando la pantalla; si se "
+                           f"queda atascado, {fin}")
+                else:
+                    txt = (f"mantiene {p['tecla']} pulsada {p['segundos']:g} s"
+                           if p["segundos"] else
+                           f"deja {p['tecla']} pulsada (hasta un 'soltar')")
             elif op == "soltar":
                 txt = f"suelta {p['tecla']}"
             elif op == "mantener_clic":
@@ -1594,6 +1705,31 @@ class Script:
     def _esperar(self, seg):
         """Como sleep, pero se corta al parar."""
         return not self._stop.wait(max(0.0, seg))
+
+    def _avanzar_vigilando(self, paso, n):
+        """Mantiene la tecla mirando si la pantalla deja de cambiar.
+
+        Devuelve (atascado, cortado).
+        """
+        self.stuck.reset()
+        self.log(f"{n}. {paso['tecla']} pulsada hasta {paso['segundos']:g} s, "
+                 f"vigilando si me quedo atascado")
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < paso["segundos"]:
+            if not self._esperar(self.stuck_intervalo):
+                return False, True
+            try:
+                atascado, cambio, umbral = self.stuck.paso()
+            except Exception as exc:
+                self.log(f"   no pude mirar la pantalla: {exc}")
+                return False, False
+            if atascado:
+                pol = paso["atasco"][0]
+                self.log(f"   ATASCADO: la pantalla apenas cambia "
+                         f"(cambio {cambio:.2f}, hace falta {umbral:.2f}) "
+                         f"tras {time.perf_counter() - t0:.1f} s → {pol}")
+                return True, False
+        return False, False
 
     def _soltar_todo(self):
         """Suelta cualquier tecla o botón que quedara pulsado."""
@@ -1724,7 +1860,21 @@ class Script:
                     k = resolver_tecla(paso["tecla"])
                     self.keyboard.press(k)
                     self._teclas.add(paso["tecla"])
-                    if paso["segundos"]:
+                    if paso.get("atasco"):
+                        atascado, cortado = self._avanzar_vigilando(paso, n)
+                        self.keyboard.release(k)
+                        self._teclas.discard(paso["tecla"])
+                        if cortado:
+                            break
+                        if atascado:
+                            pol, dest = paso["atasco"]
+                            if pol == "parar":
+                                break
+                            i = (0 if pol == "repetir"
+                                 else dest - 1 if pol == "ir" else i + 1)
+                            continue
+                        i += 1
+                    elif paso["segundos"]:
                         self.log(f"{n}. {paso['tecla']} pulsada "
                                  f"{paso['segundos']:g} s")
                         cortado = not self._esperar(paso["segundos"])
@@ -1732,9 +1882,10 @@ class Script:
                         self._teclas.discard(paso["tecla"])
                         if cortado:
                             break
+                        i += 1
                     else:
                         self.log(f"{n}. {paso['tecla']} pulsada, la dejo así")
-                    i += 1
+                        i += 1
 
                 elif op == "soltar":
                     k = resolver_tecla(paso["tecla"])
@@ -1787,6 +1938,7 @@ class Script:
 
                 elif op == "pitar":
                     beep(True)
+                    self.log(f"{n}. pitido")
                     i += 1
 
                 elif op == "ir":
@@ -2338,8 +2490,12 @@ class App:
                   "Para juegos en 1ª persona:",
                   "   girar <lados> <arriba/abajo>  ← girar 200 0 mira a la "
                   "derecha; negativo, al revés",
-                  "   mantener <tecla> [segundos]   ← sin segundos, hasta un "
-                  "'soltar'",
+                  "   mantener <tecla> [segundos] [si_atascado parar|seguir|"
+                  "repetir|ir <nº>]",
+                  "        ← sin segundos, hasta un 'soltar'. Con si_atascado "
+                  "vigila que la pantalla",
+                  "          siga cambiando: si te quedas contra una pared, "
+                  "hace lo que le digas.",
                   "   soltar <tecla>",
                   "   mantener_clic [derecho] [segundos]  ← para picar, minar…",
                   "   soltar_clic [derecho]",

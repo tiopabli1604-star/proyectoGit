@@ -321,7 +321,7 @@ Y para juegos en primera persona:
 | Instrucción | Qué hace |
 |---|---|
 | `girar <lados> <arriba/abajo>` | Gira la cámara. `girar 200 0` mira a la derecha; en negativo, al contrario. |
-| `mantener <tecla> [segundos]` | Deja una tecla pulsada. Sin segundos, hasta un `soltar`. |
+| `mantener <tecla> [segundos] [si_atascado …]` | Deja una tecla pulsada. Sin segundos, hasta un `soltar`. |
 | `soltar <tecla>` | La suelta. |
 | `mantener_clic [derecho] [segundos]` | Deja el botón pulsado: picar, minar, disparar. |
 | `soltar_clic [derecho]` | Lo suelta. |
@@ -344,6 +344,37 @@ mantener w 2
 girar -180 0
 repetir 10
 ```
+
+### Detectar que se ha quedado atascado
+
+`mantener <tecla> <segundos> si_atascado <qué hacer>` mantiene la tecla, pero
+mirando la pantalla mientras: si deja de cambiar, es que hay una pared delante o
+que el personaje se ha quedado colgado en algo, y entonces hace lo que le digas
+en vez de seguir empujando contra el muro veinte minutos.
+
+```
+mantener w 30 si_atascado ir 3
+parar
+# --- rutina de desatasco, paso 3 ---
+tecla espacio
+girar 500 0
+mantener s 1
+repetir
+```
+
+No necesita saber nada del juego: solo compara fotogramas seguidos. El umbral no
+es fijo, porque cuánto cambia la vista al andar depende del juego, del campo de
+visión y de la resolución: se toma como referencia el nivel de cambio típico
+mientras te mueves y se considera atasco cuando baja de una cuarta parte de eso,
+tres fotogramas seguidos. Hay además un mínimo absoluto, para el caso de arrancar
+ya atascado y no tener nunca una referencia alta.
+
+Solo mira la parte central de la pantalla: fuera quedan la barra de objetos, el
+chat y el objeto de la mano, que se mueven por su cuenta y ensuciarían la medida.
+
+El registro dice el cambio medido y el umbral que hacía falta, así que si se
+equivoca sabes en qué dirección. El caso más justo es andar pegado a una pared,
+donde la vista cambia poco de por sí.
 
 En `si_falla` puedes poner `parar` (lo que hace por defecto), `seguir`, `repetir`
 o `ir <nº>`. Solo tiene sentido con un límite de segundos: sin él la búsqueda no
