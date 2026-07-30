@@ -92,7 +92,24 @@ una de veinte minutos eso acaba en cualquier parte.
 
 Como el juego no dice hacia dónde miras, Golem guarda **una foto del centro de la
 vista** al empezar a grabar, y antes de reproducir la busca en la pantalla para
-recolocar la cámara ahí. Va en bucle cerrado: mira cuántos píxeles está desviada,
+recolocar la cámara ahí.
+
+**No hay que esperar nada al grabar.** La foto es una sola captura y se hace en el
+instante de pulsar F9: en cuanto el registro te lo confirma, puedes moverte. Los
+15-20 segundos de comprobaciones son al **reproducir**, y ocurren antes de que la
+macro empiece, así que no se solapan con el movimiento grabado.
+
+Lo único que importa es que la vista de ese instante **sirva** de referencia, y eso
+te lo dice ahí mismo. Hay dos formas de que no valga, y las dos se detectan antes
+de grabar veinte minutos:
+
+- **lisa** — el cielo, una pared de un color: no hay nada que reconocer;
+- **repetitiva** — una pared de ladrillos iguales: se parece a sí misma en muchos
+  sitios, así que reconocerla no dice dónde estás. Se comprueba buscándola en la
+  propia pantalla e ignorando el punto donde de verdad está; si aun así aparece
+  otro sitio casi igual de parecido, avisa.
+
+Si te avisa, para la grabación, mira hacia algo con más detalle y vuelve a empezar. Va en bucle cerrado: mira cuántos píxeles está desviada,
 gira, vuelve a mirar. La relación entre píxeles y unidades de ratón **se mide
 sola**, girando una cantidad conocida y viendo cuánto se desplaza la vista: eso
 depende de la sensibilidad que tengas puesta y del campo de visión, así que no se

@@ -505,6 +505,8 @@ class Recorder:
         self.raw_error = None
         self.ancla = None           # trozo de la vista al empezar a grabar
         self.ancla_pos = None
+        self.ancla_sirve = True     # ¿es reconocible esa vista?
+        self.ancla_aviso = ""
         self._t0 = 0.0
         self._last_move_t = 0.0
         self._m_listener = None
@@ -513,22 +515,33 @@ class Recorder:
         self.lock = threading.Lock()
 
     def start(self):
-        with self.lock:
-            self.events = []
-            self._t0 = time.perf_counter()
-            self._last_move_t = -1.0
-            self.recording = True
+        """Prepara todo ANTES de arrancar el reloj.
+
+        La foto de la vista y el registro del raw input tardan sus decenas de
+        milisegundos. Si el reloj arrancara antes, ese rato contaría como tiempo
+        grabado sin que se estuviera escuchando nada, y se perderían los primeros
+        movimientos. Así que primero se monta todo y lo último es abrir la puerta.
+        """
         self.raw_error = None
         self._raw = None
         self.ancla = None
         self.ancla_pos = None
+        self.ancla_aviso = ""
+        self.recording = False
         if self.relative:
             # una foto de hacia dónde se está mirando, para poder recolocar la
             # cámara ahí antes de reproducir
             try:
                 self.ancla, self.ancla_pos = capturar_ancla()
+                sirve, motivo = evaluar_ancla(self.ancla, self.ancla_pos)
+                self.ancla_aviso = motivo
+                if not sirve:
+                    self.ancla_sirve = False
+                else:
+                    self.ancla_sirve = True
             except Exception:
                 self.ancla, self.ancla_pos = None, None
+                self.ancla_sirve = False
             self._raw = RawMouseListener(self._on_raw_move)
             if not self._raw.start():
                 self.raw_error = self._raw.error or "motivo desconocido"
@@ -542,6 +555,11 @@ class Recorder:
             on_press=self._on_press, on_release=self._on_release)
         self._m_listener.start()
         self._k_listener.start()
+        with self.lock:
+            self.events = []
+            self._t0 = time.perf_counter()
+            self._last_move_t = -1.0
+            self.recording = True      # ya se está escuchando: ahora sí
 
     def stop(self):
         self.recording = False
@@ -1308,6 +1326,43 @@ def texto_a_ancla(txt):
     if img is None or img.size == 0:
         raise ValueError("el ancla guardada no se puede leer")
     return img
+
+
+def evaluar_ancla(ancla, pos):
+    """¿Sirve esta vista como referencia? -> (sirve, explicación).
+
+    Dos formas de que no sirva, y las dos se pueden ver en el momento, que es
+    cuando aún se arregla mirando a otro lado:
+
+      · **lisa**: el cielo, una pared de un color. Sin detalle no hay nada que
+        reconocer.
+      · **repetitiva**: una pared de ladrillos iguales, un suelo de bloques. Se
+        parece a sí misma en muchos sitios, así que reconocerla no dice dónde
+        está. Se detecta buscándola en la propia pantalla e ignorando el punto
+        donde de verdad está: si aun así aparece otro sitio casi igual de
+        parecido, es ambigua.
+    """
+    gris = cv2.cvtColor(ancla, cv2.COLOR_BGR2GRAY)
+    contraste = float(np.std(gris))
+    if contraste < 12:
+        return False, (f"la vista es demasiado lisa (contraste {contraste:.1f}); "
+                       f"no habrá nada que reconocer")
+    bgr, _mon = Finder.grab_screen()
+    if bgr.shape[0] < ancla.shape[0] or bgr.shape[1] < ancla.shape[1]:
+        return True, f"contraste {contraste:.1f}"
+    res = cv2.matchTemplate(bgr, ancla, cv2.TM_CCOEFF_NORMED)
+    ah, aw = ancla.shape[:2]
+    # tapar el sitio donde de verdad está, para ver con qué más se confunde
+    x0 = max(0, pos[0] - aw // 3)
+    y0 = max(0, pos[1] - ah // 3)
+    res[y0:pos[1] + ah // 3, x0:pos[0] + aw // 3] = -1.0
+    segundo = float(res.max()) if res.size else -1.0
+    if segundo > 0.80:
+        return False, (f"la vista se repite: hay otro sitio en la propia "
+                       f"pantalla que se le parece un {segundo:.2f}. Mira hacia "
+                       f"algo más distintivo")
+    return True, (f"contraste {contraste:.1f}, y lo más parecido en otro sitio "
+                  f"de la pantalla es {max(0.0, segundo):.2f}")
 
 
 def localizar_ancla(ancla):
@@ -3486,10 +3541,21 @@ class App:
             if self.recorder.relative:
                 if self.recorder.ancla is not None:
                     a = self.recorder.ancla
-                    self.log(f"   He guardado una foto de la vista "
-                             f"({a.shape[1]}x{a.shape[0]} px) para poder "
-                             f"recolocar la cámara aquí antes de reproducir. "
-                             f"No muevas la cámara todavía.")
+                    self.log(f"   Foto de la vista guardada "
+                             f"({a.shape[1]}x{a.shape[0]} px): con ella "
+                             f"recolocaré la cámara aquí antes de reproducir. "
+                             f"Es una sola captura, ya está hecha — puedes "
+                             f"moverte cuando quieras.")
+                    if self.recorder.ancla_sirve:
+                        self.log(f"   La vista es reconocible "
+                                 f"({self.recorder.ancla_aviso}).")
+                    else:
+                        self.log(f"   OJO: {self.recorder.ancla_aviso}. "
+                                 f"Al reproducir puede que no sepa dónde "
+                                 f"estás. Si puedes, para la grabación, mira "
+                                 f"hacia algo con más detalle y vuelve a "
+                                 f"empezar.")
+                        beep(False)
                 else:
                     self.log("   No pude guardar la foto de la vista, así que "
                              "no habrá alineación automática.")
