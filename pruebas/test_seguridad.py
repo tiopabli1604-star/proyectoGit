@@ -136,7 +136,7 @@ def p_clic_no_se_lleva_el_mantenido():
         check("y lo recupera antes de la limpieza final",
               len(ops) >= 2 and ops[-2] == "press", str(ops))
         check("lo dice en el registro",
-              any("recupero el clic mantenido" in l for l in log),
+              any("recupero lo mantenido" in l and "left" in l for l in log),
               str([l for l in log if "recupero" in l]))
     finally:
         G.click_at = orig
@@ -195,12 +195,20 @@ def p_secuencia_completa_del_captcha():
         check("reafirma al cerrarse el cofre",
               any("reafirmado" in l for l in log),
               str([l for l in log if "reafirm" in l]))
-        # press (mantener) -> release+press (reafirmar) -> release (limpieza)
+        # Se reafirma en varios sitios (el clic, el desaparecer y el reafirmar
+        # explicito), asi que hay varios pares. Lo que importa es el invariante:
+        # cada suelta va seguida de una pulsacion, salvo la ultima, que es la
+        # limpieza del final. Dos sueltas seguidas significarian que se quedo
+        # suelta sin recuperar.
         ks = [a[0] for a in s.keyboard.acciones]
-        check("la W: mantener, reafirmar, y solo la suelta la limpieza",
-              ks == ["press", "release", "press", "release"], str(ks))
-        check("o sea que quedo pulsada hasta el final",
-              len(ks) >= 2 and ks[-2] == "press", str(ks))
+        check("alterna pulsar y soltar, sin quedarse suelta",
+              ks == ["press", "release"] * (len(ks) // 2) and len(ks) % 2 == 0,
+              str(ks))
+        check("la ultima suelta es la limpieza, y antes estaba pulsada",
+              len(ks) >= 2 and ks[-1] == "release" and ks[-2] == "press",
+              str(ks[-4:]))
+        check("y se reafirmo mas de una vez", ks.count("press") >= 3,
+              f"{ks.count('press')} pulsaciones")
     finally:
         G.click_at = orig
 

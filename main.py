@@ -1856,6 +1856,18 @@ class Script:
         # personaje sigue andando solo
         self._teclas = set()
         self._botones = set()
+        # Todo lo que toque teclas o botones pasa por este cerrojo, porque el
+        # refuerzo de abajo corre en otro hilo.
+        self._lock_pulsado = threading.RLock()
+        # Refuerzo: cada pocos segundos se vuelve a pulsar lo mantenido. Es la
+        # garantía de que la W siga andando pase lo que pase — si el juego abre
+        # una interfaz se olvida de las teclas pulsadas, y no hay forma de saber
+        # desde fuera cuándo la cierra. Solo se pulsa, NO se suelta: una
+        # pulsación repetida es como la repetición automática del teclado y no
+        # molesta, mientras que soltar y volver a pulsar el ratón reiniciaría lo
+        # que estuvieras picando.
+        self.keepalive = 2.0
+        self._ka_thread = None
         self.stuck = StuckDetector()
         self.stuck_intervalo = 0.35     # s entre fotogramas al vigilar
         self.ventana_req = ""           # solo actuar si el título la contiene
@@ -2280,6 +2292,10 @@ class Script:
         self.pasos_hechos = 0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        if self.keepalive and self.keepalive > 0:
+            self._ka_thread = threading.Thread(target=self._keepalive_run,
+                                               daemon=True)
+            self._ka_thread.start()
         return True
 
     def stop(self):
@@ -2396,6 +2412,43 @@ class Script:
                 return True
         return False
 
+    def _pulsar_tecla(self, nombre):
+        with self._lock_pulsado:
+            self.keyboard.press(resolver_tecla(nombre))
+            self._teclas.add(nombre)
+
+    def _soltar_tecla(self, nombre):
+        with self._lock_pulsado:
+            try:
+                self.keyboard.release(resolver_tecla(nombre))
+            except Exception:
+                pass
+            self._teclas.discard(nombre)
+
+    def _keepalive_run(self):
+        """Refuerza las teclas mantenidas cada pocos segundos.
+
+        Es lo que hace que la W no dependa de que el guion tenga un 'reafirmar'
+        en el sitio justo: si el juego se olvida de la tecla al abrir el cofre,
+        como muy tarde se recupera al siguiente refuerzo.
+        """
+        avisado = False
+        while not self._stop.is_set():
+            if self._stop.wait(self.keepalive):
+                return
+            with self._lock_pulsado:
+                teclas = sorted(self._teclas)
+                for nombre in teclas:
+                    try:
+                        self.keyboard.press(resolver_tecla(nombre))
+                    except Exception:
+                        pass
+            if teclas and not avisado:
+                self.log(f"   (refuerzo activo: vuelvo a pulsar "
+                         f"{', '.join(teclas)} cada {self.keepalive:g} s para "
+                         f"que no se pierda si el juego abre una interfaz)")
+                avisado = True
+
     def _reafirmar(self, teclas, botones):
         """Suelta y vuelve a pulsar lo que debería seguir mantenido.
 
@@ -2411,43 +2464,45 @@ class Script:
         Soltar antes de volver a pulsar es imprescindible: si solo se pulsara,
         para Windows ya estaba pulsada y no habría pulsación nueva que mandar.
         """
-        for nombre in teclas:
-            try:
-                k = resolver_tecla(nombre)
-                self.keyboard.release(k)
-                time.sleep(0.02)
-                self.keyboard.press(k)
-                self._teclas.add(nombre)
-            except Exception:
-                pass
-        for b in botones:
-            try:
-                btn = getattr(Button, b)
-                self.mouse.release(btn)
-                time.sleep(0.02)
-                self.mouse.press(btn)
-                self._botones.add(b)
-            except Exception:
-                pass
+        with self._lock_pulsado:
+            for nombre in teclas:
+                try:
+                    k = resolver_tecla(nombre)
+                    self.keyboard.release(k)
+                    time.sleep(0.02)
+                    self.keyboard.press(k)
+                    self._teclas.add(nombre)
+                except Exception:
+                    pass
+            for b in botones:
+                try:
+                    btn = getattr(Button, b)
+                    self.mouse.release(btn)
+                    time.sleep(0.02)
+                    self.mouse.press(btn)
+                    self._botones.add(b)
+                except Exception:
+                    pass
         return list(teclas) + [f"clic {b}" for b in botones]
 
     def _soltar_todo(self):
         """Suelta cualquier tecla o botón que quedara pulsado."""
         sueltos = []
-        for nombre in list(self._teclas):
-            try:
-                self.keyboard.release(resolver_tecla(nombre))
-                sueltos.append(nombre)
-            except Exception:
-                pass
-        self._teclas.clear()
-        for b in list(self._botones):
-            try:
-                self.mouse.release(getattr(Button, b))
-                sueltos.append(f"clic {b}")
-            except Exception:
-                pass
-        self._botones.clear()
+        with self._lock_pulsado:
+            for nombre in list(self._teclas):
+                try:
+                    self.keyboard.release(resolver_tecla(nombre))
+                    sueltos.append(nombre)
+                except Exception:
+                    pass
+            self._teclas.clear()
+            for b in list(self._botones):
+                try:
+                    self.mouse.release(getattr(Button, b))
+                    sueltos.append(f"clic {b}")
+                except Exception:
+                    pass
+            self._botones.clear()
         return sueltos
 
     def _buscar(self, paso, quiero_verlo):
@@ -2510,6 +2565,15 @@ class Script:
                         else:
                             self.log(f"{n}. '{paso['objetivo']}' ha "
                                      f"desaparecido")
+                            # Que el objetivo desaparezca suele significar que se
+                            # ha cerrado una interfaz del juego, y es justo ahí
+                            # cuando hay que recuperar lo mantenido: el juego se
+                            # olvidó de las teclas al abrirla.
+                            vueltos = self._reafirmar(set(self._teclas),
+                                                      set(self._botones))
+                            if vueltos:
+                                self.log(f"   y recupero lo mantenido: "
+                                         f"{', '.join(vueltos)}")
                         i += 1
                     else:
                         pol, dest = paso["politica"]
@@ -2558,10 +2622,13 @@ class Script:
                              doble=paso["doble"], restore=self.restore_mouse,
                              move_delay=self.move_delay)
                     self.log(f"{n}. clic en ({x}, {y})")
-                    if botones:
-                        self._reafirmar((), botones)
-                        self.log(f"   y recupero el clic mantenido "
-                                 f"({', '.join(sorted(botones))})")
+                    # un clic puede abrir o cerrar una interfaz, y entonces el
+                    # juego se olvida de lo mantenido: se recupera todo, no solo
+                    # el botón que el propio clic había soltado
+                    vueltos = self._reafirmar(set(self._teclas), botones)
+                    if vueltos:
+                        self.log(f"   y recupero lo mantenido: "
+                                 f"{', '.join(vueltos)}")
                     if self.sound:
                         beep(True)
                     i += 1
@@ -2605,13 +2672,10 @@ class Script:
                     i += 1
 
                 elif op == "mantener":
-                    k = resolver_tecla(paso["tecla"])
-                    self.keyboard.press(k)
-                    self._teclas.add(paso["tecla"])
+                    self._pulsar_tecla(paso["tecla"])
                     if paso.get("atasco"):
                         atascado, cortado = self._avanzar_vigilando(paso, n)
-                        self.keyboard.release(k)
-                        self._teclas.discard(paso["tecla"])
+                        self._soltar_tecla(paso["tecla"])
                         if cortado:
                             break
                         if atascado:
@@ -2626,8 +2690,7 @@ class Script:
                         self.log(f"{n}. {paso['tecla']} pulsada "
                                  f"{paso['segundos']:g} s")
                         cortado = not self._esperar(paso["segundos"])
-                        self.keyboard.release(k)
-                        self._teclas.discard(paso["tecla"])
+                        self._soltar_tecla(paso["tecla"])
                         if cortado:
                             break
                         i += 1
@@ -2636,9 +2699,7 @@ class Script:
                         i += 1
 
                 elif op == "soltar":
-                    k = resolver_tecla(paso["tecla"])
-                    self.keyboard.release(k)
-                    self._teclas.discard(paso["tecla"])
+                    self._soltar_tecla(paso["tecla"])
                     self.log(f"{n}. soltada {paso['tecla']}")
                     i += 1
 
@@ -2713,6 +2774,10 @@ class Script:
         except Exception as exc:
             self.log(f"El guion se ha cortado por un error: {exc}")
         finally:
+            self._stop.set()          # que el refuerzo pare antes de soltar
+            if self._ka_thread:
+                self._ka_thread.join(timeout=self.keepalive + 0.5)
+                self._ka_thread = None
             if self.sonido is not None:
                 self.sonido.stop()
             sueltos = self._soltar_todo()
@@ -2762,6 +2827,7 @@ class App:
         self._log_queue = queue.Queue()
         self._status_pend = None
         self._cerrando = False
+        self._drain_id = None
 
         self._build_ui()
         self._migrado = False
@@ -3142,7 +3208,7 @@ class App:
             self._status_pend = None
         if reprogramar and not self._cerrando:
             try:
-                self.root.after(120, self._drain_log)
+                self._drain_id = self.root.after(120, self._drain_log)
             except Exception:
                 pass
 
@@ -3324,7 +3390,7 @@ class App:
                   "   clic [doble|derecho|medio]   ← donde se vio el último "
                   "objetivo",
                   "   esperar <segundos>",
-                  "   tecla <nombre>               ← esc, intro, espacio, f, 1…",
+                  "   tecla <nombre>  (o 'pulsar')  ← esc, intro, espacio, f, 1…",
                   "        también combinaciones: shift+1, ctrl+f, "
                   "ctrl+shift+intro",
                   "   escribir <texto>",
@@ -3343,6 +3409,11 @@ class App:
                   "   soltar <tecla>",
                   "   mantener_clic [derecho] [segundos]  ← para picar, minar…",
                   "   soltar_clic [derecho]",
+                  "   reafirmar   ← vuelve a pulsar lo mantenido. Ponlo DESPUÉS "
+                  "de que se cierre",
+                  "        una interfaz del juego: al abrirse el cofre, el juego "
+                  "se olvida de",
+                  "        las teclas que tenías pulsadas y la W deja de andar.",
                   "Sin segundos, 'buscar' espera indefinidamente. Los números "
                   "de paso son los que muestra 'Comprobar'. Al parar el guion se "
                   "suelta solo todo lo que hubiera quedado pulsado."):
@@ -4285,6 +4356,14 @@ class App:
 
     def _on_close(self):
         self._cerrando = True
+        # cancelar el vaciado pendiente: si salta durante el destroy, Tcl se
+        # queja de que el comando ya no existe
+        if self._drain_id is not None:
+            try:
+                self.root.after_cancel(self._drain_id)
+            except Exception:
+                pass
+            self._drain_id = None
         self._save_config()
         self._sched_stop.set()
         self._txt_stop.set()

@@ -459,7 +459,23 @@ funcionar. Son dos cosas distintas:
   porque no sabe cuándo se cierra el cofre: para eso está **`reafirmar`**, que
   suelta y vuelve a pulsar todo lo mantenido.
 
-El sitio donde ponerlo es justo después de que la interfaz se cierre:
+**No tienes que escribir `reafirmar` para que esto funcione.** Se recupera solo,
+por tres caminos:
+
+1. **al clicar** — el clic aparta el botón mantenido y lo devuelve, y además
+   reafirma las teclas, porque un clic puede abrir o cerrar una interfaz;
+2. **cuando el objetivo desaparece** — que el cristal se vaya suele significar
+   que el cofre se ha cerrado, y es justo el momento de recuperar lo mantenido;
+3. **un refuerzo de fondo** que vuelve a pulsar las teclas mantenidas cada dos
+   segundos. Es la red de seguridad: aunque el juego las suelte en un momento
+   que no hubiera previsto, vuelven como muy tarde al siguiente refuerzo.
+
+El refuerzo **solo pulsa, no suelta**. Una pulsación repetida es como la
+repetición automática del teclado y no molesta; en cambio soltar y volver a
+pulsar el ratón reiniciaría lo que estuvieras picando, así que el botón nunca se
+refuerza a ciegas — solo en los momentos 1 y 2, donde sí se sabe que hacía falta.
+
+Así que este guion ya funciona tal cual:
 
 ```
 mantener w
@@ -467,12 +483,12 @@ mantener_clic
 buscar cristal
 clic
 desaparecer cristal 30
-reafirmar
 repetir
 ```
 
-Soltar antes de volver a pulsar es imprescindible: si solo se pulsara, para
-Windows ya estaba pulsada y no habría ninguna pulsación nueva que mandar.
+`reafirmar` sigue estando por si quieres forzarlo en algún punto concreto. Cuando
+lo hace, suelta antes de volver a pulsar: si solo pulsara, para Windows ya estaba
+pulsada y no habría ninguna pulsación nueva que mandar.
 
 ### Detectar que se ha quedado atascado
 
