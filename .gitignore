@@ -1,0 +1,10 @@
+﻿build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+captcha_config.json
+captcha_log.txt
+captcha_debug.png
+captcha_clic_*.png
+captcha_plantilla.png
