@@ -507,6 +507,20 @@ class Recorder:
         self.ancla_pos = None
         self.ancla_sirve = True     # ¿es reconocible esa vista?
         self.ancla_aviso = ""
+        # Refuerzo mientras se graba: si el juego abre una interfaz se olvida de
+        # las teclas y botones que tenías pulsados, y como físicamente siguen
+        # bajados no se genera ninguna pulsación nueva. O te das cuenta y los
+        # sueltas y vuelves a pulsar, o el resto de la grabación es inútil. Esto
+        # los vuelve a pulsar por ti cada pocos segundos.
+        self.reforzar = True
+        self.keepalive = 2.0
+        self.refuerzos = 0
+        self._sostenidas = set()    # teclas que el usuario tiene pulsadas
+        self._sostenidos_btn = set()
+        self._ka_thread = None
+        self._ka_stop = threading.Event()
+        self._ka_kb = None
+        self._ka_mouse = None
         self._t0 = 0.0
         self._last_move_t = 0.0
         self._m_listener = None
@@ -555,14 +569,28 @@ class Recorder:
             on_press=self._on_press, on_release=self._on_release)
         self._m_listener.start()
         self._k_listener.start()
+        self._sostenidas = set()
+        self._sostenidos_btn = set()
+        self.refuerzos = 0
         with self.lock:
             self.events = []
             self._t0 = time.perf_counter()
             self._last_move_t = -1.0
             self.recording = True      # ya se está escuchando: ahora sí
+        if self.reforzar and self.keepalive > 0:
+            self._ka_kb = KeyboardController()
+            self._ka_mouse = MouseController()
+            self._ka_stop.clear()
+            self._ka_thread = threading.Thread(target=self._keepalive_run,
+                                               daemon=True)
+            self._ka_thread.start()
 
     def stop(self):
         self.recording = False
+        self._ka_stop.set()
+        if self._ka_thread:
+            self._ka_thread.join(timeout=self.keepalive + 0.5)
+            self._ka_thread = None
         if self._raw:
             self._raw.stop()
             self._raw = None
@@ -596,6 +624,15 @@ class Recorder:
     def _on_click(self, x, y, button, pressed):
         if not self.recording:
             return
+        if pressed:
+            # Un 'ya pulsado' otra vez no aporta nada: o es la repetición del
+            # sistema o es nuestro propio refuerzo. Descartarlo mantiene la
+            # grabación limpia y de paso evita grabar lo que inyectamos.
+            if button.name in self._sostenidos_btn:
+                return
+            self._sostenidos_btn.add(button.name)
+        else:
+            self._sostenidos_btn.discard(button.name)
         self.events.append({"t": self._now(), "e": "mc", "x": x, "y": y,
                             "b": button.name, "d": pressed})
 
@@ -608,12 +645,47 @@ class Recorder:
     def _on_press(self, key):
         if not self.recording or key in HOTKEYS:
             return
-        self.events.append({"t": self._now(), "e": "kd", "k": key_to_str(key)})
+        k = key_to_str(key)
+        # igual que con el ratón: si ya la teníamos por pulsada, esta pulsación
+        # no aporta nada (repetición del teclado, o nuestro propio refuerzo)
+        if k in self._sostenidas:
+            return
+        self._sostenidas.add(k)
+        self.events.append({"t": self._now(), "e": "kd", "k": k})
 
     def _on_release(self, key):
         if not self.recording or key in HOTKEYS:
             return
-        self.events.append({"t": self._now(), "e": "ku", "k": key_to_str(key)})
+        k = key_to_str(key)
+        self._sostenidas.discard(k)
+        self.events.append({"t": self._now(), "e": "ku", "k": k})
+
+    def _keepalive_run(self):
+        """Vuelve a pulsar lo que el usuario tiene mantenido.
+
+        Solo pulsa, nunca suelta: una pulsación repetida es inocua (es lo que
+        hace el propio teclado al mantener una tecla), mientras que soltar el
+        ratón reiniciaría lo que se estuviera picando.
+        """
+        while not self._ka_stop.is_set():
+            if self._ka_stop.wait(self.keepalive):
+                return
+            if not self.recording:
+                continue
+            teclas = sorted(self._sostenidas)
+            botones = sorted(self._sostenidos_btn)
+            for k in teclas:
+                try:
+                    self._ka_kb.press(str_to_key(k))
+                except Exception:
+                    pass
+            for b in botones:
+                try:
+                    self._ka_mouse.press(getattr(Button, b))
+                except Exception:
+                    pass
+            if teclas or botones:
+                self.refuerzos += 1
 
 
 # ---------------------------------------------------------------- reproductor
@@ -621,7 +693,7 @@ class Recorder:
 class Player:
     """Reproduce una lista de eventos con la misma cadencia temporal."""
 
-    def __init__(self, on_finish=None, on_progress=None):
+    def __init__(self, on_finish=None, on_progress=None, log=None):
         self.mouse = MouseController()
         self.keyboard = KeyboardController()
         self.playing = False
@@ -629,6 +701,50 @@ class Player:
         self._thread = None
         self.on_finish = on_finish
         self.on_progress = on_progress
+        self.log = log or (lambda _m: None)
+        # Refuerzo de lo mantenido, igual que en el guion y en el grabador. Aquí
+        # es donde más falta hace: una macro de 20 minutos que mantiene la W y el
+        # clic se queda sin hacer nada el resto del tiempo si el juego los suelta
+        # al abrir una interfaz (el captcha), porque la macro ya "pulsó" esa
+        # tecla al principio y no vuelve a hacerlo hasta que la suelta.
+        self.reforzar = True
+        self.keepalive = 2.0
+        self.refuerzos = 0
+        self._sostenidas = set()
+        self._sostenidos_btn = set()
+        self._ka_thread = None
+        self._ka_stop = threading.Event()
+
+    def _keepalive_run(self):
+        """Vuelve a pulsar lo que la macro dejó mantenido. Solo pulsa."""
+        avisado = False
+        while not self._ka_stop.is_set():
+            if self._ka_stop.wait(self.keepalive):
+                return
+            if not self.playing:
+                continue
+            teclas = sorted(self._sostenidas)
+            botones = sorted(self._sostenidos_btn)
+            for k in teclas:
+                try:
+                    self.keyboard.press(str_to_key(k))
+                except Exception:
+                    pass
+            for b in botones:
+                try:
+                    self.mouse.press(getattr(Button, b))
+                except Exception:
+                    pass
+            if teclas or botones:
+                self.refuerzos += 1
+                if not avisado:
+                    nombres = teclas + [f"clic {b}" for b in botones]
+                    self.log(f"   Refuerzo activo: vuelvo a pulsar "
+                             f"{', '.join(nombres)} cada {self.keepalive:g} s. "
+                             f"Es lo que evita que la macro se quede sin hacer "
+                             f"nada si el juego te los suelta al abrir una "
+                             f"interfaz.")
+                    avisado = True
 
     @staticmethod
     def es_relativa(events):
@@ -663,8 +779,25 @@ class Player:
         self.playing = True
         self._run(events, speed, repeats)
 
+    def _arrancar_refuerzo(self):
+        self._sostenidas = set()
+        self._sostenidos_btn = set()
+        self.refuerzos = 0
+        if self.reforzar and self.keepalive > 0:
+            self._ka_stop.clear()
+            self._ka_thread = threading.Thread(target=self._keepalive_run,
+                                               daemon=True)
+            self._ka_thread.start()
+
+    def _parar_refuerzo(self):
+        self._ka_stop.set()
+        if self._ka_thread:
+            self._ka_thread.join(timeout=self.keepalive + 0.5)
+            self._ka_thread = None
+
     def _run(self, events, speed, repeats):
         loop = 0
+        self._arrancar_refuerzo()
         try:
             while self.playing and (repeats == 0 or loop < repeats):
                 loop += 1
@@ -680,9 +813,31 @@ class Player:
                     self._exec(ev)
                 self._release_all(events)
         finally:
+            # parar el refuerzo ANTES de soltar, o resucitaría lo que se suelta
+            self._parar_refuerzo()
+            self._soltar_sostenidos()
             self.playing = False
             if self.on_finish:
                 self.on_finish()
+
+    def _soltar_sostenidos(self):
+        """Suelta lo que de verdad quedó pulsado.
+
+        _release_all lo deduce de la lista de eventos, que solo vale si la macro
+        llegó al final; si se corta a mitad, lo que hay pulsado es esto.
+        """
+        for k in list(self._sostenidas):
+            try:
+                self.keyboard.release(str_to_key(k))
+            except Exception:
+                pass
+        self._sostenidas.clear()
+        for b in list(self._sostenidos_btn):
+            try:
+                self.mouse.release(getattr(Button, b))
+            except Exception:
+                pass
+        self._sostenidos_btn.clear()
 
     def _exec(self, ev):
         e = ev["e"]
@@ -700,16 +855,20 @@ class Player:
             btn = getattr(Button, ev["b"])
             if ev["d"]:
                 self.mouse.press(btn)
+                self._sostenidos_btn.add(ev["b"])
             else:
                 self.mouse.release(btn)
+                self._sostenidos_btn.discard(ev["b"])
         elif e == "ms":
             if not self.relative:
                 self.mouse.position = (ev["x"], ev["y"])
             self.mouse.scroll(ev["dx"], ev["dy"])
         elif e == "kd":
             self.keyboard.press(str_to_key(ev["k"]))
+            self._sostenidas.add(ev["k"])
         elif e == "ku":
             self.keyboard.release(str_to_key(ev["k"]))
+            self._sostenidas.discard(ev["k"])
 
     def _release_all(self, events):
         """Suelta cualquier tecla/botón que quedara pulsado al cortar."""
@@ -2800,7 +2959,8 @@ class App:
 
         self.recorder = Recorder()
         self.player = Player(on_finish=self._on_play_finish,
-                             on_progress=self._on_play_progress)
+                             on_progress=self._on_play_progress,
+                             log=self.log)
         self.finder = Finder()
         self.watcher = Watcher(self.finder, self.log, self.set_status)
         self.targets = {}          # nombre -> perfil del Finder
@@ -2915,6 +3075,15 @@ class App:
                         variable=self.var_alinear).pack(side="left")
         ttk.Button(row4b, text="Comprobar alineación",
                    command=self.comprobar_alineacion).pack(side="left", padx=6)
+
+        row4c = ttk.Frame(fm)
+        row4c.pack(fill="x", **pad)
+        self.var_reforzar = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row4c,
+                        text="Volver a pulsar la W y el clic si el juego me los "
+                             "suelta (al grabar y al reproducir)",
+                        variable=self.var_reforzar,
+                        command=self._on_reforzar_change).pack(side="left")
 
         row5 = ttk.Frame(fm)
         row5.pack(fill="x", **pad)
@@ -3315,6 +3484,20 @@ class App:
             beep(True)
         threading.Thread(target=_do, daemon=True).start()
 
+    def _on_reforzar_change(self):
+        activo = self.var_reforzar.get()
+        self.recorder.reforzar = activo
+        self.player.reforzar = activo
+        if activo:
+            self.log(f"Refuerzo ACTIVADO, al grabar y al reproducir: cada "
+                     f"{self.recorder.keepalive:g} s se vuelve a pulsar lo que "
+                     f"esté mantenido. Es para cuando salta el captcha: el juego "
+                     f"se olvida de la W y del clic, y no llega ninguna "
+                     f"pulsación nueva ni de tus dedos ni de la macro.")
+        else:
+            self.log("Refuerzo desactivado. Si salta una interfaz del juego, la "
+                     "W y el clic se quedarán sin efecto el resto del tiempo.")
+
     # ---------- movimiento relativo ----------
     def _on_relative_change(self):
         self.recorder.relative = self.var_relative.get()
@@ -3603,12 +3786,18 @@ class App:
         if not self.recorder.recording:
             self.watcher.paused = True
             self.recorder.relative = self.var_relative.get()
+            self.recorder.reforzar = self.var_reforzar.get()
             self.recorder.start()
             self.btn_rec.configure(text=f"■ Parar grabación ({T_REC})")
             self.set_status(f"GRABANDO…  ({T_REC} para parar)")
             modo = ("movimiento relativo, para juegos en 1ª persona"
                     if self.recorder.relative else "posiciones absolutas")
             self.log(f"Grabación iniciada ({modo}).")
+            if self.recorder.reforzar:
+                self.log(f"   Refuerzo activo: si el juego te suelta la W o el "
+                         f"clic al abrir una interfaz, los vuelvo a pulsar yo "
+                         f"cada {self.recorder.keepalive:g} s. No tienes que "
+                         f"estar pendiente.")
             if self.recorder.relative:
                 if self.recorder.ancla is not None:
                     a = self.recorder.ancla
@@ -3712,9 +3901,18 @@ class App:
     def _lanzar_macro(self, speed, repeats):
         self.watcher.paused = True
         self.btn_play.configure(text=f"■ Parar ({T_PLAY})")
+        self.player.reforzar = self.var_reforzar.get()
         self.player.play(self.events, speed=speed, repeats=repeats)
         self.log(f"Reproduciendo (x{speed}, "
                  f"{'∞' if repeats == 0 else repeats} veces)…")
+        sostenidos = {e["k"] for e in self.events if e["e"] == "kd"} | \
+                     {f"clic {e['b']}" for e in self.events
+                      if e["e"] == "mc" and e["d"]}
+        if sostenidos and self.player.reforzar:
+            self.log(f"   Esta macro mantiene teclas o botones. Si el juego te "
+                     f"los suelta al abrir una interfaz, los vuelvo a pulsar "
+                     f"cada {self.player.keepalive:g} s para que la macro no se "
+                     f"quede el resto del tiempo sin hacer nada.")
 
     def _on_play_progress(self, loop, total):
         self.set_status(

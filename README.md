@@ -157,6 +157,35 @@ Si cortas la reproducción a mitad, el programa suelta automáticamente cualquie
 tecla o botón que hubiera quedado pulsado. Eso es lo que evita quedarte con el
 Shift o el clic izquierdo "enganchados".
 
+### Si el juego te suelta la W o el clic
+
+Este es el problema más traicionero de una macro larga. Vas andando con la W y el
+clic mantenidos, salta un aviso del juego —el captcha, un cofre, cualquier
+interfaz— y **el juego se olvida de lo que tenías pulsado**. Al cerrarse no le
+llega ninguna pulsación nueva: la macro ya pulsó esa tecla al principio y no
+volverá a hacerlo hasta que la suelte, y tus dedos siguen bajados sin generar
+nada. Resultado: si pasa en el minuto 3 de una grabación de 20, los 17 restantes
+no hacen nada.
+
+La casilla **Volver a pulsar la W y el clic si el juego me los suelta** lo
+arregla, y funciona en los dos lados:
+
+- **al grabar**, para que no pierdas la sesión sin darte cuenta;
+- **al reproducir**, que es donde más falta hace.
+
+Cada dos segundos vuelve a pulsar lo que esté mantenido. **Solo pulsa, nunca
+suelta**: una pulsación repetida es lo mismo que hace el teclado cuando mantienes
+una tecla, mientras que soltar el ratón y volver a pulsarlo reiniciaría el bloque
+que estuvieras picando. Y si la macro suelta la tecla a propósito, no la resucita.
+
+En las pruebas, con un juego simulado que "se olvida" de lo pulsado, la W vuelve
+en una décima de segundo y aguanta cuatro captchas seguidos. Sin esta casilla, la
+prueba demuestra que no vuelve nunca.
+
+De paso, la grabación ya no guarda las pulsaciones repetidas del sistema: una
+tecla que ya estaba pulsada no genera un evento nuevo, así que las macros salen
+más limpias.
+
 Las macros se guardan como archivos `.macro.json`, así que puedes tener varias.
 
 También puedes dejar una macro **repitiéndose sola cada N minutos** sin tenerla
