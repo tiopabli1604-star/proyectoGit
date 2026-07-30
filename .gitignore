@@ -8,6 +8,11 @@ golem_log.txt
 golem_debug.png
 golem_clic_*.png
 golem_vigilancia_*.png
+captcha_config.json
+captcha_log.txt
+captcha_debug.png
+captcha_clic_*.png
+captcha_plantilla.png
 golem_plantilla.png
 macropro_config.json
 debug_deteccion.png

@@ -12,7 +12,7 @@ SUITES = ("test_base.py", "test_zona.py", "test_escena_real.py",
           "test_seguridad.py", "test_sensores.py", "test_combos.py",
           "test_ancla.py", "test_ancla_calidad.py", "test_mantenido.py",
           "test_reproduccion_mantenido.py", "test_agrupado.py",
-          "test_integracion.py")
+          "test_integracion.py", "test_captcha_app.py")
 
 if __name__ == "__main__":
     fallos = []

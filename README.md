@@ -1,5 +1,10 @@
 # Golem
 
+> **¿Solo quieres lo del captcha?** Hay una versión aparte, más simple, que solo
+> vigila la pantalla y clica: **[Golem Captcha](LEEME-CAPTCHA.md)**
+> (`GolemCaptcha.exe`). No graba macros ni toca el teclado. Este README es el del
+> programa completo.
+
 Un gólem es un autómata al que le enseñas una tarea y la repite por ti. Esto es
 eso, en tres piezas:
 
