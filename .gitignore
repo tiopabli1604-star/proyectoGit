@@ -17,3 +17,7 @@ golem_plantilla.png
 macropro_config.json
 debug_deteccion.png
 *.macro.json
+
+# los binarios de AutoCaptcha viven en su propia rama
+AutoCaptcha.exe
+AutoCaptcha-carpeta.zip
