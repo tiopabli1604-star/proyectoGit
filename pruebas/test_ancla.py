@@ -194,6 +194,7 @@ def p_busca_girando():
         # de entrada no deberia reconocerla
         _l, s0 = G.localizar_ancla(ancla)
         ok, detalle = G.alinear_camara(ancla, pos, mover=m.mover, espera=0.0,
+                                       buscar=True,
                                        log=lambda _m: None)
         loc, _s = G.localizar_ancla(ancla)
         err = (pos[0] - loc[0], pos[1] - loc[1]) if loc else None
@@ -226,7 +227,7 @@ def p_no_esta_en_ningun_sitio():
     m2 = MundoFalso(semilla=99)
     m2.instalar()
     ok, detalle = G.alinear_camara(ancla, _pos, mover=m2.mover, espera=0.0,
-                                   log=lambda _m: None)
+                                   buscar=True, log=lambda _m: None)
     check("no alinea", not ok)
     check("dice que ha girado y no la ha visto",
           "no he reconocido la vista" in detalle
@@ -259,6 +260,7 @@ def p_camara_lenta_y_rapida():
         ancla, pos = G.capturar_ancla()
         m.desviar(2200, 0)
         ok, detalle = G.alinear_camara(ancla, pos, mover=m.mover, espera=0.0,
+                                       buscar=True,
                                        log=lambda _m: None)
         loc, _s = G.localizar_ancla(ancla)
         err = (pos[0] - loc[0], pos[1] - loc[1]) if loc else None

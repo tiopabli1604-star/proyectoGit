@@ -521,6 +521,8 @@ class Recorder:
         self._ka_stop = threading.Event()
         self._ka_kb = None
         self._ka_mouse = None
+        self._acum_dx = self._acum_dy = 0
+        self._ultimo_mr = -1.0
         self._t0 = 0.0
         self._last_move_t = 0.0
         self._m_listener = None
@@ -572,6 +574,8 @@ class Recorder:
         self._sostenidas = set()
         self._sostenidos_btn = set()
         self.refuerzos = 0
+        self._acum_dx = self._acum_dy = 0
+        self._ultimo_mr = -1.0
         with self.lock:
             self.events = []
             self._t0 = time.perf_counter()
@@ -586,6 +590,7 @@ class Recorder:
             self._ka_thread.start()
 
     def stop(self):
+        self._vaciar_acumulado()
         self.recording = False
         self._ka_stop.set()
         if self._ka_thread:
@@ -606,11 +611,33 @@ class Recorder:
         return time.perf_counter() - self._t0
 
     def _on_raw_move(self, dx, dy):
-        """Un informe del ratón: se guarda el delta sin tocar ni agrupar."""
+        """Un informe del ratón, agrupado a ~125 por segundo.
+
+        Un ratón gaming manda hasta 1000 informes por segundo. Guardarlos todos
+        hace una macro enorme que al reproducirla no se puede seguir: el bucle
+        se retrasa, los eventos se amontonan y el giro sale a tirones en vez de
+        continuo. Sumando los deltas de cada intervalo de 8 ms el recorrido
+        total es exactamente el mismo, pero se reproduce fluido.
+        """
         if not self.recording:
             return
-        self.events.append({"t": self._now(), "e": "mr", "dx": int(dx),
-                            "dy": int(dy)})
+        t = self._now()
+        self._acum_dx += int(dx)
+        self._acum_dy += int(dy)
+        if t - self._ultimo_mr < self.MOVE_MIN_INTERVAL:
+            return
+        self._ultimo_mr = t
+        if self._acum_dx or self._acum_dy:
+            self.events.append({"t": t, "e": "mr", "dx": self._acum_dx,
+                                "dy": self._acum_dy})
+            self._acum_dx = self._acum_dy = 0
+
+    def _vaciar_acumulado(self):
+        """Lo que quedara sin emitir al parar, para no perder recorrido."""
+        if self._acum_dx or self._acum_dy:
+            self.events.append({"t": self._now(), "e": "mr",
+                                "dx": self._acum_dx, "dy": self._acum_dy})
+            self._acum_dx = self._acum_dy = 0
 
     def _on_move(self, x, y):
         if not self.recording or self.relative:
@@ -1652,7 +1679,7 @@ def buscar_ancla_girando(ancla, parecido_min, mover, espera, log,
 
 def alinear_camara(ancla, destino, parecido_min=0.55, tolerancia=4,
                    intentos=8, calib=60, espera=0.18, mover=None, log=None,
-                   buscar=True, espera_barrido=0.12):
+                   buscar=False, espera_barrido=0.12):
     """Gira la cámara hasta que la vista vuelva a estar como al grabar.
 
     Bucle cerrado: se busca el trozo de referencia, se mira cuántos píxeles está
@@ -1677,7 +1704,9 @@ def alinear_camara(ancla, destino, parecido_min=0.55, tolerancia=4,
         if not buscar:
             return False, (f"no reconozco la vista (parecido {score:.2f}, hace "
                            f"falta {parecido_min:.2f}). Ponte más o menos donde "
-                           f"estabas al grabar y vuelve a intentarlo.")
+                           f"estabas al grabar y vuelve a intentarlo. (Buscarla "
+                           f"girando está desactivado a propósito: da muchas "
+                           f"vueltas seguidas y eso llama la atención.)")
         apunta(f"   no reconozco la vista de entrada (parecido {score:.2f}); "
                f"la busco girando.")
         # durante el barrido basta con una espera más corta: solo hace falta
@@ -3075,6 +3104,13 @@ class App:
                         variable=self.var_alinear).pack(side="left")
         ttk.Button(row4b, text="Comprobar alineación",
                    command=self.comprobar_alineacion).pack(side="left", padx=6)
+        self.var_buscar_vista = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4b,
+                        text="…y buscarla girando si no la reconoce (da muchas "
+                             "vueltas: llama la atención)",
+                        variable=self.var_buscar_vista,
+                        command=self._on_buscar_vista_change).pack(side="left",
+                                                                   padx=6)
 
         row4c = ttk.Frame(fm)
         row4c.pack(fill="x", **pad)
@@ -3484,6 +3520,18 @@ class App:
             beep(True)
         threading.Thread(target=_do, daemon=True).start()
 
+    def _on_buscar_vista_change(self):
+        if self.var_buscar_vista.get():
+            self.log("Buscar la vista girando: ACTIVADO. Aviso de lo que hace: "
+                     "si no reconoce la vista, gira la cámara dando algo más de "
+                     "una vuelta completa en siete alturas distintas, entre 20 y "
+                     "80 segundos girando sin parar. Eso es exactamente lo que "
+                     "hace un spinbot, y un servidor con anticheat lo va a ver.")
+            beep(False)
+        else:
+            self.log("Buscar la vista girando: desactivado. Si no reconoce la "
+                     "vista, no reproduce y te avisa, y colocas la cámara tú.")
+
     def _on_reforzar_change(self):
         activo = self.var_reforzar.get()
         self.recorder.reforzar = activo
@@ -3877,8 +3925,9 @@ class App:
             def _alinear_y_reproducir():
                 self.log("Alineando la cámara con la vista de la grabación…")
                 try:
-                    ok, detalle = alinear_camara(self.ancla_img, self.ancla_pos,
-                                                 log=self.log)
+                    ok, detalle = alinear_camara(
+                        self.ancla_img, self.ancla_pos, log=self.log,
+                        buscar=self.var_buscar_vista.get())
                 except Exception as exc:
                     ok, detalle = False, f"error al alinear: {exc}"
                 self.log(("   " if ok else "   NO alineada: ") + detalle)
