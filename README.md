@@ -1,9 +1,14 @@
 # Golem
 
-> **¿Solo quieres lo del captcha?** Hay una versión aparte, más simple, que solo
-> vigila la pantalla y clica: **[Golem Captcha](LEEME-CAPTCHA.md)**
-> (`GolemCaptcha.exe`). No graba macros ni toca el teclado. Este README es el del
-> programa completo.
+> **¿Solo quieres lo del captcha?** Está separado, en la rama
+> **[`autocaptcha`](../../tree/autocaptcha)**: mira una zona de la pantalla y
+> clica el aviso, y nada más. Ni macros, ni teclado, ni cámara. Este README es el
+> del programa completo.
+>
+> Los dos usan el mismo buscador. `motor.py` sale de este `main.py` copiando los
+> bloques tal cual, y `pruebas/test_mismo_motor.py` lo comprueba: el texto de las
+> clases tiene que ser idéntico línea por línea y dar los mismos resultados sobre
+> las mismas escenas. Si alguien toca uno y no el otro, esa prueba se pone roja.
 
 Un gólem es un autómata al que le enseñas una tarea y la repite por ti. Esto es
 eso, en tres piezas:

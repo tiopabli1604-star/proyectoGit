@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Lanza las tres suites y resume. Uso: python pruebas/correr_todo.py"""
+"""Lanza todas las suites y resume. Uso: python pruebas/correr_todo.py"""
 import os
 import subprocess
 import sys
@@ -12,7 +12,10 @@ SUITES = ("test_base.py", "test_zona.py", "test_escena_real.py",
           "test_seguridad.py", "test_sensores.py", "test_combos.py",
           "test_ancla.py", "test_ancla_calidad.py", "test_mantenido.py",
           "test_reproduccion_mantenido.py", "test_agrupado.py",
-          "test_integracion.py", "test_captcha_app.py")
+          "test_integracion.py",
+          # motor.py es el que se lleva la rama autocaptcha: esta suite
+          # comprueba que sigue siendo el mismo codigo que el de main.py
+          "test_mismo_motor.py")
 
 if __name__ == "__main__":
     fallos = []
