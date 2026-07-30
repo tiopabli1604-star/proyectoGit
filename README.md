@@ -314,6 +314,7 @@ Una por línea. Todo lo que vaya tras `#` es un comentario.
 | `escribir <texto>` | Teclea el texto tal cual. |
 | `macro <archivo.macro.json>` | Reproduce una macro grabada y espera a que acabe. |
 | `pitar` | Un pitido, para saber por dónde va sin mirar. |
+| `reafirmar` | Vuelve a pulsar lo que estuviera mantenido. Ver más abajo. |
 | `ir <nº>` / `repetir [veces]` / `parar` | Salta a un paso, vuelve al 1 (sin número, sin parar), o termina. |
 
 Y para juegos en primera persona:
@@ -344,6 +345,36 @@ mantener w 2
 girar -180 0
 repetir 10
 ```
+
+### Cuando el juego te suelta las teclas
+
+Si mantienes la W andando y salta el captcha, al cerrarse el cofre el personaje
+se queda quieto aunque la tecla siga "pulsada". Y si mantenías el clic, deja de
+funcionar. Son dos cosas distintas:
+
+- **El clic** lo suelta el propio clic del captcha: `clic` hace pulsar y soltar el
+  botón, y si es el mismo que estabas manteniendo, lo deja suelto. Esto se arregla
+  solo — antes de clicar aparta el botón mantenido y después lo recupera.
+- **La tecla** la olvida el juego: al abrirse una interfaz deja de tener en cuenta
+  las teclas pulsadas, pero Windows sigue creyéndolas pulsadas, así que al
+  cerrarse no le llega ninguna pulsación nueva. Eso no lo puede adivinar Golem,
+  porque no sabe cuándo se cierra el cofre: para eso está **`reafirmar`**, que
+  suelta y vuelve a pulsar todo lo mantenido.
+
+El sitio donde ponerlo es justo después de que la interfaz se cierre:
+
+```
+mantener w
+mantener_clic
+buscar cristal
+clic
+desaparecer cristal 30
+reafirmar
+repetir
+```
+
+Soltar antes de volver a pulsar es imprescindible: si solo se pulsara, para
+Windows ya estaba pulsada y no habría ninguna pulsación nueva que mandar.
 
 ### Detectar que se ha quedado atascado
 
@@ -419,6 +450,44 @@ todo lo demás.
 Cada paso se ve en el registro con su número y lo que ha hecho, y la barra de
 estado dice en qué paso va. Igual que el vigilante, `buscar` exige ver el
 objetivo en **dos escaneos seguidos** antes de darlo por bueno.
+
+## Seguridad
+
+### Actuar solo si el juego está delante
+
+Es lo que evita el desastre clásico de los macros: te vas al navegador y el
+programa sigue clicando y tecleando ahí. Pon un trozo del título de la ventana
+del juego en **Actuar solo si la ventana de delante contiene**, o abre el juego y
+pulsa **Usar la de ahora**.
+
+Con eso puesto, si te vas a otra ventana el vigilante deja de clicar y el guion se
+**pausa y suelta las teclas** que tuviera mantenidas — no se queda la W pulsada en
+tu escritorio. Al volver a poner el juego delante sigue por donde iba y recupera
+lo que estaba manteniendo.
+
+### Guardia
+
+Tres cosas para dejarlo solo mucho rato:
+
+- **Abortar si aparece** — elige uno de tus objetivos guardados y, si aparece en
+  pantalla, se para todo. Para la pantalla de muerte, un "has sido expulsado" o un
+  mensaje que no quieras dejar pasar. Corre en paralelo, sin tener que meterlo en
+  el guion.
+- **Parar a las N horas** — un límite de tiempo, y se para todo solo.
+- **Captura cada N minutos** — guarda `golem_vigilancia_01.png` … `_12.png` en
+  rotación, con la hora escrita encima, para que al volver puedas ver qué pasó
+  mientras no estabas.
+
+Pon a `0` lo que no quieras usar.
+
+### ¿Ha servido el clic?
+
+Después de cada clic automático el vigilante vuelve a mirar: si el objetivo sigue
+ahí, lo dice en el registro. Así te enteras de que el clic no está contando sin
+esperar a que pasen tres captchas.
+
+En el guion eso mismo lo hace `desaparecer <objetivo> <segundos> si_falla …`, que
+además te deja decidir qué hacer.
 
 ## Ejecutar desde el código fuente
 

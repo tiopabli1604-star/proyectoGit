@@ -116,6 +116,7 @@ APP_DIR, DATA_MOTIVO = _elegir_dir_datos()
 CONFIG_PATH = os.path.join(APP_DIR, "golem_config.json")
 DEBUG_IMG = os.path.join(APP_DIR, "golem_debug.png")
 SHOT_PATH = os.path.join(APP_DIR, "golem_clic_%d.png")
+WATCH_SHOT = os.path.join(APP_DIR, "golem_vigilancia_%02d.png")
 TEMPLATE_IMG = os.path.join(APP_DIR, "golem_plantilla.png")
 LOG_PATH = os.path.join(APP_DIR, "golem_log.txt")
 
@@ -410,6 +411,25 @@ class RawMouseListener:
         _user32.PostMessageW(wintypes.HWND(hwnd), WM_CLOSE, 0, 0)
         if self._thread:
             self._thread.join(timeout=1.5)
+
+
+_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+_user32.GetForegroundWindow.restype = wintypes.HWND
+
+
+def ventana_activa():
+    """Título de la ventana que tiene el foco. Cadena vacía si no se sabe."""
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        n = int(_user32.GetWindowTextLengthW(hwnd))
+        buf = ctypes.create_unicode_buffer(n + 2)
+        _user32.GetWindowTextW(hwnd, buf, n + 2)
+        return buf.value or ""
+    except Exception:
+        return ""
 
 
 def click_at(mouse, x, y, boton="left", doble=False, restore=True,
@@ -1048,6 +1068,13 @@ class Watcher:
         self.move_delay = 0.20        # s entre mover el ratón y pulsar
         self.clicks_done = 0
         self.last_click_time = None
+        self.ventana_req = ""         # solo clicar si el título la contiene
+        self.verificar = True         # comprobar que el objetivo se fue
+
+    def ventana_ok(self):
+        if not self.ventana_req:
+            return True
+        return self.ventana_req.lower() in ventana_activa().lower()
 
     def start(self):
         if self.active:
@@ -1067,6 +1094,12 @@ class Watcher:
             time.sleep(self.interval)
             if self.paused or not self.active:
                 pending = None
+                continue
+            if not self.ventana_ok():
+                pending = None
+                if self.status:
+                    self.status(f"VIGILANDO EN PAUSA — delante está "
+                                f"«{ventana_activa()}»")
                 continue
             espera = self.cooldown - (time.perf_counter() - last_click)
             if espera > 0:
@@ -1111,6 +1144,18 @@ class Watcher:
                                   for c in found[1:4])
                 self.log(f"   competían: {otros}. Si alguno de esos es el "
                          f"bueno, aprieta la zona con F2.")
+            if self.verificar:
+                # ¿ha servido de algo? Si el objetivo sigue ahí, el clic no
+                # contó, y eso conviene saberlo antes de 15 minutos
+                time.sleep(0.6)
+                try:
+                    sigue = self.finder.candidates()
+                except Exception:
+                    sigue = None
+                if sigue and abs(sigue[0][0] - x) < 40 \
+                        and abs(sigue[0][1] - y) < 40:
+                    self.log("   ojo: el objetivo sigue ahí después del clic. "
+                             "O no ha contado, o tarda en desaparecer.")
             if self.sound:
                 beep(True)
 
@@ -1332,6 +1377,7 @@ class Script:
         self._botones = set()
         self.stuck = StuckDetector()
         self.stuck_intervalo = 0.35     # s entre fotogramas al vigilar
+        self.ventana_req = ""           # solo actuar si el título la contiene
 
     # ---------- análisis ----------
     @classmethod
@@ -1555,7 +1601,7 @@ class Script:
                     else:
                         p["veces"] = int(args[0])
 
-            elif op in ("parar", "pitar"):
+            elif op in ("parar", "pitar", "reafirmar"):
                 if args:
                     errores.append(f"línea {nlin}: '{op}' no lleva nada detrás")
 
@@ -1670,6 +1716,9 @@ class Script:
                 txt = f"reproduce la macro {os.path.basename(p['ruta'])}"
             elif op == "pitar":
                 txt = "pita"
+            elif op == "reafirmar":
+                txt = ("vuelve a pulsar lo que estuviera mantenido (tras "
+                       "abrirse y cerrarse una interfaz del juego)")
             elif op == "ir":
                 txt = f"salta al paso {p['destino']}"
             elif op == "repetir":
@@ -1731,6 +1780,74 @@ class Script:
                 return True, False
         return False, False
 
+    def ventana_ok(self):
+        if not self.ventana_req:
+            return True
+        return self.ventana_req.lower() in ventana_activa().lower()
+
+    def _esperar_ventana(self):
+        """Si el juego no está delante, suelta todo y espera a que vuelva.
+
+        Es la diferencia entre pausarse y ponerse a teclear comandos en el
+        navegador. Al volver se reafirma lo que estuviera mantenido, porque
+        durante la pausa se ha soltado de verdad.
+        """
+        if self.ventana_ok():
+            return True
+        teclas, botones = set(self._teclas), set(self._botones)
+        sueltos = self._soltar_todo()
+        self.log(f"En pausa: delante está «{ventana_activa()}» y espero "
+                 f"«{self.ventana_req}»."
+                 + (f" Suelto {', '.join(sueltos)}." if sueltos else ""))
+        if self.status:
+            self.status(f"GUION EN PAUSA — esperando «{self.ventana_req}»")
+        while not self._stop.is_set():
+            if not self._esperar(0.5):
+                return False
+            if self.ventana_ok():
+                if teclas or botones:
+                    self._reafirmar(teclas, botones)
+                self.log("Vuelvo: la ventana ya está delante."
+                         + (" Recupero lo que estaba mantenido."
+                            if teclas or botones else ""))
+                return True
+        return False
+
+    def _reafirmar(self, teclas, botones):
+        """Suelta y vuelve a pulsar lo que debería seguir mantenido.
+
+        Hacen falta las dos cosas, y por dos motivos distintos:
+
+          · un 'clic' del propio guion hace press+release del botón, y si ese
+            botón era el que estábamos manteniendo, lo deja suelto;
+          · al abrirse una interfaz del juego (el cofre del captcha) el juego se
+            olvida de las teclas que tenía pulsadas, pero Windows sigue
+            creyéndolas pulsadas, así que al cerrarse no le llega ninguna
+            pulsación nueva y el personaje se queda quieto.
+
+        Soltar antes de volver a pulsar es imprescindible: si solo se pulsara,
+        para Windows ya estaba pulsada y no habría pulsación nueva que mandar.
+        """
+        for nombre in teclas:
+            try:
+                k = resolver_tecla(nombre)
+                self.keyboard.release(k)
+                time.sleep(0.02)
+                self.keyboard.press(k)
+                self._teclas.add(nombre)
+            except Exception:
+                pass
+        for b in botones:
+            try:
+                btn = getattr(Button, b)
+                self.mouse.release(btn)
+                time.sleep(0.02)
+                self.mouse.press(btn)
+                self._botones.add(b)
+            except Exception:
+                pass
+        return list(teclas) + [f"clic {b}" for b in botones]
+
     def _soltar_todo(self):
         """Suelta cualquier tecla o botón que quedara pulsado."""
         sueltos = []
@@ -1789,6 +1906,8 @@ class Script:
         vueltas = {}          # paso de 'repetir' -> vueltas dadas
         try:
             while not self._stop.is_set() and 0 <= i < len(self.steps):
+                if not self._esperar_ventana():
+                    break
                 paso = self.steps[i]
                 op = paso["op"]
                 n = i + 1
@@ -1826,12 +1945,33 @@ class Script:
                                  f"paro.")
                         break
                     x, y = self.last_pos
+                    # el clic haría release del botón, y si es el que estamos
+                    # manteniendo lo dejaría suelto: se aparta y se restituye
+                    botones = set(self._botones)
+                    for b in botones:
+                        try:
+                            self.mouse.release(getattr(Button, b))
+                        except Exception:
+                            pass
+                    self._botones.clear()
                     click_at(self.mouse, x, y, boton=paso["boton"],
                              doble=paso["doble"], restore=self.restore_mouse,
                              move_delay=self.move_delay)
                     self.log(f"{n}. clic en ({x}, {y})")
+                    if botones:
+                        self._reafirmar((), botones)
+                        self.log(f"   y recupero el clic mantenido "
+                                 f"({', '.join(sorted(botones))})")
                     if self.sound:
                         beep(True)
+                    i += 1
+
+                elif op == "reafirmar":
+                    vueltos = self._reafirmar(set(self._teclas),
+                                              set(self._botones))
+                    self.log(f"{n}. reafirmado: "
+                             + (", ".join(vueltos) if vueltos
+                                else "no había nada mantenido"))
                     i += 1
 
                 elif op == "esperar":
@@ -2000,6 +2140,9 @@ class App:
         self._txt_stop = threading.Event()
         self._txt_thread = None
         self._txt_count = 0
+        self._guard_stop = threading.Event()
+        self._guard_thread = None
+        self._guard_payload = ("", 0.0, 0.0)
         # copias normales de ajustes que leen otros hilos, porque las variables
         # de Tkinter solo se pueden tocar desde el hilo de la interfaz
         self._logfile_on = True
@@ -2234,6 +2377,40 @@ class App:
         ttk.Button(rowc3, text="Ver último clic",
                    command=self.open_shot).pack(side="left", padx=4)
 
+        # --- seguridad y guardia ---
+        fs = ttk.LabelFrame(self.root, text=" Seguridad ")
+        fs.pack(fill="x", **pad)
+
+        rs1 = ttk.Frame(fs)
+        rs1.pack(fill="x", **pad)
+        ttk.Label(rs1, text="Actuar solo si la ventana de delante contiene:").pack(
+            side="left")
+        self.var_ventana = tk.StringVar(value="")
+        ttk.Entry(rs1, textvariable=self.var_ventana, width=16).pack(
+            side="left", padx=4)
+        ttk.Button(rs1, text="Usar la de ahora",
+                   command=self.usar_ventana_actual).pack(side="left", padx=4)
+
+        rs2 = ttk.Frame(fs)
+        rs2.pack(fill="x", **pad)
+        self.var_guard_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rs2, text="Guardia:", variable=self.var_guard_on,
+                        command=self._toggle_guard).pack(side="left")
+        ttk.Label(rs2, text="abortar si aparece").pack(side="left", padx=(4, 0))
+        self.var_guard_target = tk.StringVar(value="")
+        self.cmb_guard = ttk.Combobox(rs2, textvariable=self.var_guard_target,
+                                      width=12, state="readonly")
+        self.cmb_guard.pack(side="left", padx=4)
+        ttk.Label(rs2, text="parar a las").pack(side="left", padx=(6, 0))
+        self.var_guard_horas = tk.StringVar(value="0")
+        ttk.Spinbox(rs2, textvariable=self.var_guard_horas, from_=0, to=48,
+                    width=4).pack(side="left", padx=2)
+        ttk.Label(rs2, text="h · captura cada").pack(side="left")
+        self.var_guard_shot = tk.StringVar(value="0")
+        ttk.Spinbox(rs2, textvariable=self.var_guard_shot, from_=0, to=600,
+                    width=4).pack(side="left", padx=2)
+        ttk.Label(rs2, text="min").pack(side="left")
+
         # --- opciones generales ---
         fo = ttk.Frame(self.root)
         fo.pack(fill="x", **pad)
@@ -2380,6 +2557,9 @@ class App:
             w.restore_mouse = self.var_restore.get()
             w.sound = self.var_sound.get()
             w.shots = self.var_shots.get()
+            req = self.var_ventana.get().strip()
+            w.ventana_req = req
+            self.script.ventana_req = req
         except ValueError:
             self.log("Aviso: algún parámetro no es un número válido; "
                      "se mantienen los anteriores.")
@@ -2410,6 +2590,10 @@ class App:
             self.var_txt_on.set(False)
             self._toggle_text_scheduler()
             paro.append("texto programado")
+        if self.var_guard_on.get():
+            self.var_guard_on.set(False)
+            self._guard_stop.set()
+            paro.append("guardia")
         self.set_status("PARADA TOTAL")
         self.log("PARADA TOTAL: " + (", ".join(paro) if paro
                                      else "no había nada activo") + ".")
@@ -2436,6 +2620,10 @@ class App:
         self.cmb_targets.configure(values=nombres)
         if self.var_target.get() not in nombres:
             self.var_target.set(nombres[0] if nombres else "")
+        # la guardia elige entre los mismos objetivos, más "ninguno"
+        self.cmb_guard.configure(values=[""] + nombres)
+        if self.var_guard_target.get() not in [""] + nombres:
+            self.var_guard_target.set("")
 
     def save_target(self):
         nombre = self.var_new_target.get().strip()
@@ -2789,6 +2977,104 @@ class App:
             self.log("Repetición programada: lanzando la macro.")
             self.root.after(0, self.toggle_play)
 
+    def usar_ventana_actual(self):
+        t = ventana_activa()
+        if not t or APP_NAME in t:
+            self.log("Pon delante la ventana del juego y vuelve a pulsarlo "
+                     "(ahora la de delante es la de Golem).")
+            return
+        # una palabra suele bastar y aguanta que el título cambie
+        self.var_ventana.set(t.split()[0][:24])
+        self._apply_settings()
+        self.log(f"Solo actuaré cuando delante haya una ventana cuyo título "
+                 f"contenga «{self.var_ventana.get()}» (la de ahora es "
+                 f"«{t}»). Si te vas a otra ventana, todo se pausa y suelta "
+                 f"las teclas.")
+
+    # ---------- guardia: abortar, límite de tiempo y capturas ----------
+    def _toggle_guard(self):
+        if not self.var_guard_on.get():
+            self._guard_stop.set()
+            self.log("Guardia desactivada.")
+            return
+        try:
+            horas = float(self.var_guard_horas.get().replace(",", ".") or 0)
+            cada = float(self.var_guard_shot.get().replace(",", ".") or 0)
+        except ValueError:
+            self.log("El límite de horas o los minutos de captura no son "
+                     "números válidos.")
+            self.var_guard_on.set(False)
+            return
+        objetivo = self.var_guard_target.get().strip()
+        if objetivo and objetivo not in self.targets:
+            self.log(f"No hay un objetivo llamado '{objetivo}'. Guárdalo "
+                     f"primero en la pestaña Guion.")
+            self.var_guard_on.set(False)
+            return
+        if not objetivo and horas <= 0 and cada <= 0:
+            self.log("La guardia no tiene nada que hacer: elige un objetivo "
+                     "para abortar, un límite de horas o un intervalo de "
+                     "capturas.")
+            self.var_guard_on.set(False)
+            return
+        self._guard_payload = (objetivo, horas, cada)
+        self._guard_stop.clear()
+        self._guard_thread = threading.Thread(target=self._guard_run,
+                                              daemon=True)
+        self._guard_thread.start()
+        partes = []
+        if objetivo:
+            partes.append(f"aborta todo si aparece '{objetivo}'")
+        if horas > 0:
+            partes.append(f"para todo a las {horas:g} h")
+        if cada > 0:
+            partes.append(f"guarda una captura cada {cada:g} min")
+        self.log("Guardia activada: " + "; ".join(partes) + ".")
+
+    def _guard_run(self):
+        objetivo, horas, cada = self._guard_payload
+        t0 = time.perf_counter()
+        proxima_foto = t0 + cada * 60 if cada > 0 else None
+        buscador = Finder() if objetivo else None
+        n_foto = 0
+        while not self._guard_stop.wait(2.0):
+            ahora = time.perf_counter()
+            if horas > 0 and ahora - t0 >= horas * 3600:
+                self.log(f"Guardia: se han cumplido las {horas:g} horas. "
+                         f"Paro todo.")
+                self.root.after(0, self.panic)
+                return
+            if proxima_foto and ahora >= proxima_foto:
+                proxima_foto = ahora + cada * 60
+                n_foto += 1
+                self._guardar_vigilancia(n_foto)
+            if buscador is not None:
+                try:
+                    buscador.apply(self.targets[objetivo])
+                    if buscador.candidates():
+                        self.log(f"Guardia: ha aparecido '{objetivo}'. "
+                                 f"ABORTO todo.")
+                        beep(False)
+                        self.root.after(0, self.panic)
+                        return
+                except Exception as exc:
+                    self.log(f"Guardia: no pude mirar '{objetivo}' ({exc}).")
+                    return
+
+    def _guardar_vigilancia(self, n):
+        """Una captura de cómo va la cosa, para verlo al volver."""
+        try:
+            bgr, _mon = self.finder.grab_screen()
+            peq = cv2.resize(bgr, None, fx=0.5, fy=0.5,
+                             interpolation=cv2.INTER_AREA)
+            cv2.putText(peq, time.strftime("%Y-%m-%d %H:%M:%S"), (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            ruta = WATCH_SHOT % (n % 12 + 1)     # 12 en rotación, no llena nada
+            cv2.imwrite(ruta, peq)
+            self.log(f"Guardia: captura {os.path.basename(ruta)}")
+        except Exception as exc:
+            self.log(f"Guardia: no pude guardar la captura ({exc}).")
+
     # ---------- texto programado ----------
     def _ocupado(self):
         """¿Hay algo moviendo el ratón o el teclado ahora mismo?"""
@@ -3078,7 +3364,10 @@ class App:
             "repeats": self.var_repeats, "speed": self.var_speed,
             "sched_min": self.var_sched_min,
             "txt_min": self.var_txt_min, "txt_text": self.var_txt_text,
-            "txt_key": self.var_txt_key,
+            "txt_key": self.var_txt_key, "ventana": self.var_ventana,
+            "guard_target": self.var_guard_target,
+            "guard_horas": self.var_guard_horas,
+            "guard_shot": self.var_guard_shot,
         }
 
     def _load_config(self):
@@ -3152,6 +3441,7 @@ class App:
         self._save_config()
         self._sched_stop.set()
         self._txt_stop.set()
+        self._guard_stop.set()
         self.script.stop()
         self.player.stop()
         self.watcher.stop()
