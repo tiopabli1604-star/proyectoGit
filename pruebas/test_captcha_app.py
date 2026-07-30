@@ -16,8 +16,9 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import main as G
+import motor as G
 import captcha as C
+import main as Golem
 
 W, H = 1920, 1080
 MON = {"left": 0, "top": 0, "width": W, "height": H}
@@ -118,8 +119,8 @@ def zona_cofre(app):
 def p_no_pisa_a_golem():
     print("--- no comparte archivos con Golem ---")
     check("config distinto", os.path.basename(C.CONFIG_PATH)
-          != os.path.basename(G.CONFIG_PATH),
-          f"{os.path.basename(C.CONFIG_PATH)} vs {os.path.basename(G.CONFIG_PATH)}")
+          != os.path.basename(Golem.CONFIG_PATH),
+          f"{os.path.basename(C.CONFIG_PATH)} vs {os.path.basename(Golem.CONFIG_PATH)}")
     check("registro distinto", "captcha" in os.path.basename(C.LOG_PATH))
     check("imagen de depuracion distinta", "captcha" in os.path.basename(G.DEBUG_IMG))
     check("capturas de clic distintas", "captcha" in os.path.basename(G.SHOT_PATH))
@@ -141,12 +142,12 @@ def p_solo_lo_del_captcha():
         # si alguien tiene los dos abiertos, una tecla no puede significar dos
         # cosas distintas: F9 aqui no puede ponerse a grabar una macro alli
         check("ninguna choca con grabar o reproducir de Golem",
-              G.HOTKEY_RECORD not in C.HOTKEYS
-              and G.HOTKEY_PLAY not in C.HOTKEYS)
-        equivalencias = {C.HOTKEY_ZONE: G.HOTKEY_ZONE,
-                         C.HOTKEY_PICK: G.HOTKEY_PICK,
-                         C.HOTKEY_WATCH: G.HOTKEY_WATCH,
-                         C.HOTKEY_PANIC: G.HOTKEY_PANIC}
+              Golem.HOTKEY_RECORD not in C.HOTKEYS
+              and Golem.HOTKEY_PLAY not in C.HOTKEYS)
+        equivalencias = {C.HOTKEY_ZONE: Golem.HOTKEY_ZONE,
+                         C.HOTKEY_PICK: Golem.HOTKEY_PICK,
+                         C.HOTKEY_WATCH: Golem.HOTKEY_WATCH,
+                         C.HOTKEY_PANIC: Golem.HOTKEY_PANIC}
         check("y cada una significa lo mismo que en Golem",
               all(a == b for a, b in equivalencias.items()),
               str({a.name: b.name for a, b in equivalencias.items()}))

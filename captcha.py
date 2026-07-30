@@ -31,9 +31,9 @@ from tkinter import ttk
 import cv2
 import mss
 
-import main as G
+import motor as G
 
-APP_NAME = "Golem Captcha"
+APP_NAME = "AutoCaptcha"
 
 # Archivos propios, para no pisarse con los de Golem. Se reaprovecha la misma
 # lógica de dónde guardarlos (junto al ejecutable, o en LOCALAPPDATA si se está
