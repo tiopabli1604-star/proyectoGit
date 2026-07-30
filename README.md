@@ -12,13 +12,48 @@ eso, en tres piezas:
 
 ## Instalación rápida (sin Python)
 
-1. Descarga `Golem.exe` de este repositorio (botón **Download raw file**).
-2. Ponlo en una carpeta cualquiera, por ejemplo el Escritorio.
-3. Doble clic.
+Hay dos formatos. Empieza por el segundo si tu antivirus se queja.
+
+**Un solo archivo:** descarga `Golem.exe` (botón **Download raw file**), ponlo en
+una carpeta cualquiera —por ejemplo el Escritorio— y doble clic.
+
+**En carpeta:** descarga `Golem-carpeta.zip`, descomprímelo donde quieras y abre
+el `Golem.exe` de dentro. Ocupa más, pero da muchos menos problemas con los
+antivirus (ver abajo).
 
 La primera vez Windows puede mostrar el aviso de SmartScreen ("Windows protegió
 tu PC") porque el ejecutable no está firmado digitalmente. Se resuelve con
 **Más información → Ejecutar de todas formas**.
+
+### Si el antivirus dice que es un troyano
+
+Puede pasar, y conviene entender por qué antes de decidir qué hacer.
+
+Este programa engancha el teclado y el ratón de forma global, inyecta pulsaciones
+y clics sintéticos, lee el ratón por *raw input* y captura la pantalla. Esa
+combinación es, punto por punto, el comportamiento de un keylogger o de un troyano
+de acceso remoto. Un antivirus que juzga por comportamiento **tiene motivos para
+sospechar**: no está siendo tonto, está viendo lo que hay.
+
+Lo que sí es específico del formato de un solo archivo: se autoextrae en una
+carpeta temporal y se ejecuta desde ahí, que es la técnica de los *droppers*. Por
+eso la versión en carpeta se marca mucho menos — no hay autoextracción.
+
+Opciones, de la más limpia a la más cómoda:
+
+1. **Ejecútalo desde el código fuente** (ver más abajo). No hay ejecutable, así
+   que no hay nada que marcar. Es lo que recomiendo si tienes Python.
+2. **Usa `Golem-carpeta.zip`** en vez del archivo único.
+3. **Repórtalo como falso positivo** en el formulario de Microsoft
+   (*Submit a file for malware analysis*). Si lo aceptan, deja de marcarse para
+   todo el mundo.
+4. **Añade una exclusión** en tu antivirus para la carpeta donde lo tengas. Eso lo
+   decides tú: significa que ese sitio deja de estar vigilado, así que hazlo solo
+   porque sabes de dónde salió este programa y puedes leer su código.
+
+Y no te fíes de que yo diga que es limpio: el código está entero en este
+repositorio, son unos pocos miles de líneas de Python legible, y puedes compilarlo
+tú mismo con los dos comandos del final.
 
 Junto al ejecutable se crean sus archivos de trabajo: `golem_config.json` (tus
 ajustes), `golem_log.txt` (registro), `golem_plantilla.png` (la imagen de
@@ -660,6 +695,15 @@ pyinstaller --onefile --windowed --name Golem main.py
 ```
 
 El ejecutable aparece en `dist/Golem.exe`.
+
+Para la versión en carpeta, que da menos problemas con los antivirus:
+
+```bash
+pyinstaller --onedir --windowed --name Golem main.py
+```
+
+Aparece en `dist/Golem/`, con el ejecutable dentro (7 MB) y sus bibliotecas al
+lado. Hay que mover la carpeta entera, no solo el `.exe`.
 
 ## Notas
 
