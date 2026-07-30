@@ -35,13 +35,13 @@ copiar el `.exe` al Escritorio y abrirlo desde ahí.
 
 | Tecla | Acción |
 |-------|--------|
-| F6    | Empezar / parar grabación |
-| F7    | Reproducir / parar reproducción |
+| F9    | Empezar / parar grabación |
+| F10   | Reproducir / parar reproducción |
 | F2    | Marcar la zona de búsqueda (una esquina por pulsación) |
 | F8    | Cuentagotas: capturar el color bajo el ratón y calibrarse solo |
 | F4    | Capturar la imagen bajo el ratón como referencia |
-| F9    | Activar / desactivar el vigilante |
-| F10   | Ejecutar / parar el guion de varios pasos |
+| F6    | Activar / desactivar el vigilante |
+| F7    | Ejecutar / parar el guion de varios pasos |
 | F12   | **Parada total de emergencia** |
 
 Funcionan aunque la ventana del programa no esté en primer plano. **F12** corta
@@ -82,6 +82,43 @@ donde apunta la mira, y moverlo rompería la cámara.
 
 No hay que marcar nada para reproducir. El modo se deduce del contenido de la
 macro, así que las macros que ya tuvieras siguen funcionando igual que antes.
+
+### Que la cámara arranque donde arrancó al grabar
+
+Este es el problema serio del movimiento relativo: **no sabe hacia dónde apunta
+la cámara, solo cuánto se mueve.** Si al reproducir la vista no arranca donde
+arrancó al grabar, toda la grabación va desviada desde el primer segundo — y en
+una de veinte minutos eso acaba en cualquier parte.
+
+Como el juego no dice hacia dónde miras, Golem guarda **una foto del centro de la
+vista** al empezar a grabar, y antes de reproducir la busca en la pantalla para
+recolocar la cámara ahí. Va en bucle cerrado: mira cuántos píxeles está desviada,
+gira, vuelve a mirar. La relación entre píxeles y unidades de ratón **se mide
+sola**, girando una cantidad conocida y viendo cuánto se desplaza la vista: eso
+depende de la sensibilidad que tengas puesta y del campo de visión, así que no se
+puede suponer. Y el signo también se aprende, en vez de dar por hecho hacia dónde
+gira la cámara.
+
+- **Si lo consigue**, reproduce. En las pruebas le bastan dos giros de
+  calibración y una corrección.
+- **Si no reconoce la vista** (estás mirando a otro sitio, o el juego no está
+  delante), **no reproduce**, y lo dice. Eso es lo que evita estropear la
+  grabación: mejor no empezar que empezar torcido.
+- **Si giras y la vista no se mueve**, te avisa de que el ratón no parece estar
+  capturado por el juego.
+
+El botón **Comprobar alineación** te dice cuánto está desviada ahora mismo, sin
+tocar la cámara ni reproducir. Y la casilla **Alinear la cámara antes de
+reproducir** lo desactiva si prefieres colocarla a mano.
+
+La foto viaja dentro del propio `.macro.json` (unos 100 KB), así que la macro
+sigue siendo un solo archivo que puedes copiar.
+
+Un aviso honesto: girar la cámara en primera persona no es exactamente desplazar
+la imagen —hay perspectiva—, así que la relación píxeles/ratón solo es lineal en
+distancias cortas, y menos en vertical que en horizontal. El bucle admite hasta
+ocho correcciones, que sobra para un desvío pequeño; si te has ido muy lejos,
+colócate a mano más o menos y vuelve a intentarlo.
 
 Si cortas la reproducción a mitad, el programa suelta automáticamente cualquier
 tecla o botón que hubiera quedado pulsado. Eso es lo que evita quedarte con el

@@ -11,16 +11,17 @@ Un gólem al que le enseñas una tarea y la repite por ti:
     dentro de la zona que marques, que no necesita calibración alguna.
 
 Hotkeys globales:
-  F6  = grabar / parar grabación
-  F7  = reproducir / parar reproducción
+  F9  = grabar / parar grabación
+  F10 = reproducir / parar reproducción
   F2  = marcar la zona de búsqueda: dos esquinas, una pulsación cada una
   F8  = cuentagotas: capturar el color bajo el ratón y calibrarse solo
   F4  = capturar plantilla: recorta la imagen bajo el ratón como referencia
-  F9  = activar / desactivar el vigilante
-  F10 = ejecutar / parar el guion de varios pasos
+  F6  = activar / desactivar el vigilante
+  F7  = ejecutar / parar el guion de varios pasos
   F12 = PARADA TOTAL de emergencia
 """
 
+import base64
 import ctypes
 import json
 import math
@@ -120,16 +121,27 @@ WATCH_SHOT = os.path.join(APP_DIR, "golem_vigilancia_%02d.png")
 TEMPLATE_IMG = os.path.join(APP_DIR, "golem_plantilla.png")
 LOG_PATH = os.path.join(APP_DIR, "golem_log.txt")
 
-HOTKEY_RECORD = keyboard.Key.f6
-HOTKEY_PLAY = keyboard.Key.f7
+HOTKEY_RECORD = keyboard.Key.f9
+HOTKEY_PLAY = keyboard.Key.f10
 HOTKEY_PICK = keyboard.Key.f8
 HOTKEY_TEMPLATE = keyboard.Key.f4
-HOTKEY_WATCH = keyboard.Key.f9
+HOTKEY_WATCH = keyboard.Key.f6
 HOTKEY_ZONE = keyboard.Key.f2
-HOTKEY_SCRIPT = keyboard.Key.f10
+HOTKEY_SCRIPT = keyboard.Key.f7
 HOTKEY_PANIC = keyboard.Key.f12
 HOTKEYS = {HOTKEY_RECORD, HOTKEY_PLAY, HOTKEY_PICK, HOTKEY_TEMPLATE,
            HOTKEY_WATCH, HOTKEY_ZONE, HOTKEY_SCRIPT, HOTKEY_PANIC}
+
+# Los nombres para los botones y los mensajes salen de las constantes de
+# arriba: así, si se cambia una tecla, no queda ninguna etiqueta mintiendo.
+T_REC = HOTKEY_RECORD.name.upper()
+T_PLAY = HOTKEY_PLAY.name.upper()
+T_PICK = HOTKEY_PICK.name.upper()
+T_TPL = HOTKEY_TEMPLATE.name.upper()
+T_WATCH = HOTKEY_WATCH.name.upper()
+T_ZONE = HOTKEY_ZONE.name.upper()
+T_SCRIPT = HOTKEY_SCRIPT.name.upper()
+T_PANIC = HOTKEY_PANIC.name.upper()
 
 SCALE = 0.5  # las capturas de color se analizan a media resolución
 
@@ -491,6 +503,8 @@ class Recorder:
         self.recording = False
         self.relative = False       # modo para juegos en primera persona
         self.raw_error = None
+        self.ancla = None           # trozo de la vista al empezar a grabar
+        self.ancla_pos = None
         self._t0 = 0.0
         self._last_move_t = 0.0
         self._m_listener = None
@@ -506,7 +520,15 @@ class Recorder:
             self.recording = True
         self.raw_error = None
         self._raw = None
+        self.ancla = None
+        self.ancla_pos = None
         if self.relative:
+            # una foto de hacia dónde se está mirando, para poder recolocar la
+            # cámara ahí antes de reproducir
+            try:
+                self.ancla, self.ancla_pos = capturar_ancla()
+            except Exception:
+                self.ancla, self.ancla_pos = None, None
             self._raw = RawMouseListener(self._on_raw_move)
             if not self._raw.start():
                 self.raw_error = self._raw.error or "motivo desconocido"
@@ -1252,6 +1274,115 @@ def turn_camera(dx, dy, paso_max=15, gap=0.008, espera=None):
             else:
                 time.sleep(gap)
     return hecho_x, hecho_y
+
+
+# ------------------------------------------- ancla de la cámara (1ª persona)
+#
+# El movimiento relativo no sabe hacia dónde apunta la cámara: solo cuánto se
+# mueve. Si al reproducir la vista no arranca donde arrancó al grabar, TODA la
+# grabación va desviada desde el primer segundo, y en 20 minutos eso acaba en
+# cualquier parte. Como el juego no dice hacia dónde mira, se guarda un trozo de
+# la propia vista al empezar a grabar: eso sí se puede reconocer después, y con
+# ello se recoloca la cámara antes de reproducir.
+
+ANCLA_FRAC = 0.30      # lado del recorte, en fracción de pantalla
+
+
+def capturar_ancla():
+    """Recorta el centro de la vista. Devuelve (imagen, (x, y) donde estaba)."""
+    bgr, _mon = Finder.grab_screen()
+    h, w = bgr.shape[:2]
+    lw, lh = max(32, int(w * ANCLA_FRAC)), max(32, int(h * ANCLA_FRAC))
+    x0, y0 = (w - lw) // 2, (h - lh) // 2
+    return np.ascontiguousarray(bgr[y0:y0 + lh, x0:x0 + lw]), (x0, y0)
+
+
+def ancla_a_texto(img):
+    ok, buf = cv2.imencode(".png", img)
+    return base64.b64encode(buf.tobytes()).decode("ascii") if ok else None
+
+
+def texto_a_ancla(txt):
+    datos = np.frombuffer(base64.b64decode(txt), np.uint8)
+    img = cv2.imdecode(datos, cv2.IMREAD_COLOR)
+    if img is None or img.size == 0:
+        raise ValueError("el ancla guardada no se puede leer")
+    return img
+
+
+def localizar_ancla(ancla):
+    """¿Dónde está ahora ese trozo de vista? -> ((x, y), parecido 0-1)."""
+    bgr, _mon = Finder.grab_screen()
+    if bgr.shape[0] < ancla.shape[0] or bgr.shape[1] < ancla.shape[1]:
+        return None, 0.0
+    res = cv2.matchTemplate(bgr, ancla, cv2.TM_CCOEFF_NORMED)
+    _mn, mx, _ml, loc = cv2.minMaxLoc(res)
+    return (int(loc[0]), int(loc[1])), float(mx)
+
+
+def alinear_camara(ancla, destino, parecido_min=0.55, tolerancia=4,
+                   intentos=8, calib=60, espera=0.18, mover=None, log=None):
+    """Gira la cámara hasta que la vista vuelva a estar como al grabar.
+
+    Bucle cerrado: se busca el trozo de referencia, se mira cuántos píxeles está
+    desviado y se corrige. La relación entre píxeles y unidades de ratón se mide
+    sola, inyectando un giro conocido y viendo cuánto se desplaza la vista:
+    depende de la sensibilidad que tenga puesta el juego y del campo de visión,
+    así que no se puede suponer. También se aprende el signo de esa forma, en vez
+    de dar por hecho hacia dónde gira la cámara al mover el ratón.
+
+    Devuelve (alineada, explicación).
+    """
+    mover = mover or (lambda dx, dy: turn_camera(dx, dy))
+    apunta = log or (lambda _m: None)
+
+    def mirar():
+        time.sleep(espera)       # que el juego pinte el fotograma nuevo
+        return localizar_ancla(ancla)
+
+    loc, score = mirar()
+    if loc is None or score < parecido_min:
+        return False, (f"no reconozco la vista (parecido {score:.2f}, hace "
+                       f"falta {parecido_min:.2f}). Ponte más o menos donde "
+                       f"estabas al grabar y vuelve a intentarlo.")
+
+    # --- medir cuántas unidades de ratón hace falta por píxel, y en qué signo
+    factores = {}
+    for eje, (dx, dy) in (("x", (calib, 0)), ("y", (0, calib))):
+        antes = loc
+        mover(dx, dy)
+        loc, score = mirar()
+        if loc is None or score < parecido_min:
+            return False, (f"al girar para calibrar he perdido la referencia "
+                           f"(parecido {score:.2f}). La vista cambia demasiado.")
+        desp = (loc[0] - antes[0]) if eje == "x" else (loc[1] - antes[1])
+        if abs(desp) < 3:
+            return False, (f"he girado {calib} y la vista apenas se ha movido "
+                           f"({desp} px en {eje}). ¿Está el juego delante y con "
+                           f"el ratón capturado?")
+        factores[eje] = calib / float(desp)
+        apunta(f"   calibrado {eje}: {calib} unidades = {desp} px "
+               f"({factores[eje]:+.2f} por px)")
+
+    # --- corregir hasta que quede dentro de la tolerancia
+    for intento in range(1, intentos + 1):
+        err_x = destino[0] - loc[0]
+        err_y = destino[1] - loc[1]
+        if abs(err_x) <= tolerancia and abs(err_y) <= tolerancia:
+            return True, (f"cámara alineada: sobran {err_x:+d}, {err_y:+d} px "
+                          f"(tolerancia {tolerancia}) en {intento - 1} "
+                          f"corrección(es)")
+        mover(int(round(err_x * factores["x"])),
+              int(round(err_y * factores["y"])))
+        loc, score = mirar()
+        if loc is None or score < parecido_min:
+            return False, (f"he perdido la referencia al corregir "
+                           f"(parecido {score:.2f})")
+        apunta(f"   corrección {intento}: quedan "
+               f"{destino[0] - loc[0]:+d}, {destino[1] - loc[1]:+d} px")
+    return False, (f"no consigo alinearla: tras {intentos} intentos quedan "
+                   f"{destino[0] - loc[0]:+d}, {destino[1] - loc[1]:+d} px de "
+                   f"desvío. Colócate a mano más cerca y repite.")
 
 
 class ZoneChange:
@@ -2426,6 +2557,8 @@ class App:
         self.script = Script(self.log, self.targets, self.set_status,
                              on_finish=self._on_script_finish)
         self.events = []
+        self.ancla_img = None       # foto de la vista al grabar (1ª persona)
+        self.ancla_pos = None
         self.current_file = None
         self._zone_p1 = None
         self._sched_stop = threading.Event()
@@ -2450,9 +2583,10 @@ class App:
         self._load_config()
         self._start_hotkeys()
         self._drain_log()          # arranca el vaciado periódico de la cola
-        self.log(f"{APP_NAME} listo. F6 grabar | F7 reproducir | "
-                 f"F2 marcar zona | F8 cuentagotas | F4 plantilla | "
-                 f"F9 vigilar | F10 guion | F12 PARAR")
+        self.log(f"{APP_NAME} listo. {T_REC} grabar | {T_PLAY} reproducir | "
+                 f"{T_ZONE} marcar zona | {T_PICK} cuentagotas | "
+                 f"{T_TPL} plantilla | {T_WATCH} vigilar | "
+                 f"{T_SCRIPT} guion | {T_PANIC} PARAR")
         if DATA_MOTIVO:
             self.log(f"AVISO: {DATA_MOTIVO}, así que guardo tus ajustes en "
                      f"{APP_DIR}. Si quieres tenerlo todo junto al programa, "
@@ -2479,10 +2613,10 @@ class App:
 
         row1 = ttk.Frame(fm)
         row1.pack(fill="x", **pad)
-        self.btn_rec = ttk.Button(row1, text="● Grabar (F6)",
+        self.btn_rec = ttk.Button(row1, text=f"● Grabar ({T_REC})",
                                   command=self.toggle_record)
         self.btn_rec.pack(side="left", padx=4)
-        self.btn_play = ttk.Button(row1, text="▶ Reproducir (F7)",
+        self.btn_play = ttk.Button(row1, text=f"▶ Reproducir ({T_PLAY})",
                                    command=self.toggle_play)
         self.btn_play.pack(side="left", padx=4)
         ttk.Button(row1, text="Abrir…", command=self.load_macro).pack(
@@ -2521,6 +2655,15 @@ class App:
                              "Minecraft, FPS…)",
                         variable=self.var_relative,
                         command=self._on_relative_change).pack(side="left")
+
+        row4b = ttk.Frame(fm)
+        row4b.pack(fill="x", **pad)
+        self.var_alinear = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row4b,
+                        text="Alinear la cámara antes de reproducir",
+                        variable=self.var_alinear).pack(side="left")
+        ttk.Button(row4b, text="Comprobar alineación",
+                   command=self.comprobar_alineacion).pack(side="left", padx=6)
 
         row5 = ttk.Frame(fm)
         row5.pack(fill="x", **pad)
@@ -2582,11 +2725,11 @@ class App:
 
         rowc0 = ttk.Frame(fc)
         rowc0.pack(fill="x", **pad)
-        ttk.Button(rowc0, text="Cuentagotas de color (F8)",
+        ttk.Button(rowc0, text=f"Cuentagotas de color ({T_PICK})",
                    command=self.pick_color).pack(side="left", padx=4)
-        ttk.Button(rowc0, text="Capturar imagen (F4)",
+        ttk.Button(rowc0, text=f"Capturar imagen ({T_TPL})",
                    command=self.capture_template).pack(side="left", padx=4)
-        ttk.Button(rowc0, text="Marcar zona (F2)",
+        ttk.Button(rowc0, text=f"Marcar zona ({T_ZONE})",
                    command=self.mark_zone).pack(side="left", padx=4)
         ttk.Button(rowc0, text="Toda la pantalla",
                    command=self.reset_zone).pack(side="left", padx=4)
@@ -2595,7 +2738,7 @@ class App:
 
         rowc1 = ttk.Frame(fc)
         rowc1.pack(fill="x", **pad)
-        self.btn_watch = ttk.Button(rowc1, text="Activar vigilancia (F9)",
+        self.btn_watch = ttk.Button(rowc1, text=f"Activar vigilancia ({T_WATCH})",
                                     command=self.toggle_watch)
         self.btn_watch.pack(side="left", padx=4)
         ttk.Button(rowc1, text="Probar detección (3 s)",
@@ -2718,7 +2861,7 @@ class App:
         ttk.Checkbutton(fo, text="Guardar registro en archivo",
                         variable=self.var_logfile,
                         command=self._apply_logfile).pack(side="left", padx=10)
-        ttk.Button(fo, text="■ PARADA TOTAL (F12)",
+        ttk.Button(fo, text=f"■ PARADA TOTAL ({T_PANIC})",
                    command=self.panic).pack(side="right", padx=4)
 
         # --- registro ---
@@ -2761,7 +2904,7 @@ class App:
         r2.pack(fill="x", **pad)
         ttk.Button(r2, text="Comprobar",
                    command=self.check_script).pack(side="left", padx=4)
-        self.btn_script = ttk.Button(r2, text="▶ Ejecutar guion (F10)",
+        self.btn_script = ttk.Button(r2, text=f"▶ Ejecutar guion ({T_SCRIPT})",
                                      command=self.toggle_script)
         self.btn_script.pack(side="left", padx=4)
         ttk.Button(r2, text="Instrucciones",
@@ -2865,18 +3008,18 @@ class App:
         paro = []
         if self.script.running:
             self.script.stop()
-            self.btn_script.configure(text="▶ Ejecutar guion (F10)")
+            self.btn_script.configure(text=f"▶ Ejecutar guion ({T_SCRIPT})")
             paro.append("guion")
         if self.player.playing:
             self.player.stop()
             paro.append("reproducción")
         if self.watcher.active:
             self.watcher.stop()
-            self.btn_watch.configure(text="Activar vigilancia (F9)")
+            self.btn_watch.configure(text=f"Activar vigilancia ({T_WATCH})")
             paro.append("vigilancia")
         if self.recorder.recording:
             self.events = self.recorder.stop()
-            self.btn_rec.configure(text="● Grabar (F6)")
+            self.btn_rec.configure(text=f"● Grabar ({T_REC})")
             paro.append("grabación")
         if self.var_sched.get():
             self.var_sched.set(False)
@@ -2894,6 +3037,32 @@ class App:
         self.log("PARADA TOTAL: " + (", ".join(paro) if paro
                                      else "no había nada activo") + ".")
         beep(False)
+
+    def comprobar_alineacion(self):
+        """Dice cuánto está desviada la cámara, sin tocarla ni reproducir."""
+        if self.ancla_img is None:
+            self.log("Esta macro no trae foto de la vista. Se guarda al empezar "
+                     f"a grabar con 'Movimiento relativo' marcado ({T_REC}).")
+            return
+        destino = self.ancla_pos
+
+        def _do():
+            loc, score = localizar_ancla(self.ancla_img)
+            if loc is None:
+                self.log("No pude comparar la vista.")
+                return
+            self.log(f"Parecido con la vista de la grabación: {score:.2f} "
+                     f"(hace falta 0.55 para poder alinear).")
+            if score < 0.55:
+                self.log("   Es poco: estás mirando a otro sitio, o el juego no "
+                         "está delante. Colócate más o menos donde grabaste.")
+                beep(False)
+                return
+            self.log(f"   Desvío: {destino[0] - loc[0]:+d} px en horizontal, "
+                     f"{destino[1] - loc[1]:+d} px en vertical. Al reproducir "
+                     f"se corrige solo.")
+            beep(True)
+        threading.Thread(target=_do, daemon=True).start()
 
     # ---------- movimiento relativo ----------
     def _on_relative_change(self):
@@ -3025,7 +3194,7 @@ class App:
         if self.script.running:
             self.script.stop()
             self.log("Guion parado.")
-            self.btn_script.configure(text="▶ Ejecutar guion (F10)")
+            self.btn_script.configure(text=f"▶ Ejecutar guion ({T_SCRIPT})")
             self.set_status("Inactivo")
             return
         if self.recorder.recording or self.player.playing:
@@ -3033,7 +3202,7 @@ class App:
                      "macro.")
             return
         if self.watcher.active:
-            self.log("Desactiva la vigilancia (F9) antes de lanzar el guion: "
+            self.log(f"Desactiva la vigilancia ({T_WATCH}) antes de lanzar el guion: "
                      "los dos quieren mover el ratón.")
             return
         texto = self.txt_script.get("1.0", "end")
@@ -3048,13 +3217,13 @@ class App:
         self.script.sound = self.var_sound.get()
         self.script.interval = max(0.05, float(self.var_interval.get() or 1.0))
         if self.script.start():
-            self.btn_script.configure(text="■ Parar guion (F10)")
+            self.btn_script.configure(text=f"■ Parar guion ({T_SCRIPT})")
             self.log(f"Guion en marcha ({len(self.script.steps)} pasos). "
-                     f"F10 o F12 para pararlo.")
+                     f"{T_SCRIPT} o {T_PANIC} para pararlo.")
 
     def _on_script_finish(self):
         def _fin():
-            self.btn_script.configure(text="▶ Ejecutar guion (F10)")
+            self.btn_script.configure(text=f"▶ Ejecutar guion ({T_SCRIPT})")
             self.set_status("Inactivo")
             self.log("Guion terminado.")
         self.root.after(0, _fin)
@@ -3062,15 +3231,15 @@ class App:
     def _on_mode_change(self):
         self._apply_settings()
         if self.finder.mode == "unico":
-            self.log("Modo 'lo único con color': no hace falta el cuentagotas. "
-                     "Marca la zona con F2 y listo — dentro de ella clicará lo "
-                     "único que tenga color, sea del tono que sea.")
+            self.log(f"Modo 'lo único con color': no hace falta el cuentagotas. "
+                     f"Marca la zona con {T_ZONE} y listo — dentro de ella "
+                     f"clicará lo único que tenga color, sea del tono que sea.")
         elif self.finder.mode == "color":
-            self.log("Modo 'un color concreto': usa el cuentagotas (F8) sobre "
-                     "el objetivo para calibrar el tono.")
+            self.log(f"Modo 'un color concreto': usa el cuentagotas ({T_PICK}) "
+                     f"sobre el objetivo para calibrar el tono.")
         else:
-            self.log("Modo 'imagen de referencia': captura el recorte con F4. "
-                     "No sirve con objetos encantados.")
+            self.log(f"Modo 'imagen de referencia': captura el recorte con "
+                     f"{T_TPL}. No sirve con objetos encantados.")
 
     # ---------- zona de búsqueda ----------
     def mark_zone(self):
@@ -3179,11 +3348,21 @@ class App:
             self.watcher.paused = True
             self.recorder.relative = self.var_relative.get()
             self.recorder.start()
-            self.btn_rec.configure(text="■ Parar grabación (F6)")
-            self.set_status("GRABANDO…  (F6 para parar)")
+            self.btn_rec.configure(text=f"■ Parar grabación ({T_REC})")
+            self.set_status(f"GRABANDO…  ({T_REC} para parar)")
             modo = ("movimiento relativo, para juegos en 1ª persona"
                     if self.recorder.relative else "posiciones absolutas")
             self.log(f"Grabación iniciada ({modo}).")
+            if self.recorder.relative:
+                if self.recorder.ancla is not None:
+                    a = self.recorder.ancla
+                    self.log(f"   He guardado una foto de la vista "
+                             f"({a.shape[1]}x{a.shape[0]} px) para poder "
+                             f"recolocar la cámara aquí antes de reproducir. "
+                             f"No muevas la cámara todavía.")
+                else:
+                    self.log("   No pude guardar la foto de la vista, así que "
+                             "no habrá alineación automática.")
             if self.recorder.raw_error:
                 self.log(f"   Pero no pude leer el ratón por raw input "
                          f"({self.recorder.raw_error}), así que no se grabará "
@@ -3191,8 +3370,10 @@ class App:
                 beep(False)
         else:
             self.events = self.recorder.stop()
+            self.ancla_img = self.recorder.ancla
+            self.ancla_pos = self.recorder.ancla_pos
             self.watcher.paused = False
-            self.btn_rec.configure(text="● Grabar (F6)")
+            self.btn_rec.configure(text=f"● Grabar ({T_REC})")
             dur = self.events[-1]["t"] if self.events else 0
             rel = Player.es_relativa(self.events)
             movs = sum(1 for e in self.events if e["e"] in ("mm", "mr"))
@@ -3230,8 +3411,40 @@ class App:
         except ValueError:
             self.log("Repeticiones/velocidad no válidas.")
             return
+        # Alinear la cámara antes de empezar: con movimiento relativo, arrancar
+        # mirando a otro sitio desvía toda la grabación desde el primer segundo.
+        if (Player.es_relativa(self.events) and self.ancla_img is not None
+                and self.var_alinear.get()):
+            self.btn_play.configure(text=f"■ Parar ({T_PLAY})")
+            self.set_status("ALINEANDO LA CÁMARA…")
+
+            def _alinear_y_reproducir():
+                self.log("Alineando la cámara con la vista de la grabación…")
+                try:
+                    ok, detalle = alinear_camara(self.ancla_img, self.ancla_pos,
+                                                 log=self.log)
+                except Exception as exc:
+                    ok, detalle = False, f"error al alinear: {exc}"
+                self.log(("   " if ok else "   NO alineada: ") + detalle)
+                if not ok:
+                    self.log("No reproduzco: con la cámara desviada la "
+                             "grabación entera saldría torcida. Colócate como "
+                             "al grabar, o desmarca 'Alinear la cámara'.")
+                    beep(False)
+                    self.root.after(0, lambda: (
+                        self.btn_play.configure(text=f"▶ Reproducir ({T_PLAY})"),
+                        self.set_status("Inactivo")))
+                    return
+                beep(True)
+                self.root.after(0, lambda: self._lanzar_macro(speed, repeats))
+            threading.Thread(target=_alinear_y_reproducir, daemon=True).start()
+            return
+        self.btn_play.configure(text=f"■ Parar ({T_PLAY})")
+        self._lanzar_macro(speed, repeats)
+
+    def _lanzar_macro(self, speed, repeats):
         self.watcher.paused = True
-        self.btn_play.configure(text="■ Parar (F7)")
+        self.btn_play.configure(text=f"■ Parar ({T_PLAY})")
         self.player.play(self.events, speed=speed, repeats=repeats)
         self.log(f"Reproduciendo (x{speed}, "
                  f"{'∞' if repeats == 0 else repeats} veces)…")
@@ -3239,12 +3452,12 @@ class App:
     def _on_play_progress(self, loop, total):
         self.set_status(
             f"REPRODUCIENDO  vuelta {loop}/{'∞' if total == 0 else total}  "
-            f"(F7 para parar)")
+            f"({T_PLAY} para parar)")
 
     def _on_play_finish(self):
         self.watcher.paused = False
         self.root.after(0, lambda: self.btn_play.configure(
-            text="▶ Reproducir (F7)"))
+            text=f"▶ Reproducir ({T_PLAY})"))
         self.set_status("Inactivo")
         self.log("Reproducción terminada.")
 
@@ -3603,11 +3816,18 @@ class App:
         if not path:
             return
         rel = Player.es_relativa(self.events)
+        datos = {"version": 3, "relative": rel, "events": self.events}
+        # el ancla va dentro del propio archivo, para que la macro siga siendo
+        # una sola cosa que se puede copiar de un sitio a otro
+        if rel and self.ancla_img is not None:
+            txt = ancla_a_texto(self.ancla_img)
+            if txt:
+                datos["ancla"] = txt
+                datos["ancla_pos"] = list(self.ancla_pos)
         with open(path, "w", encoding="utf-8") as f:
             # 'relative' es informativo: al cargar se deduce de los eventos, así
             # que una macro de la versión 1 sigue reproduciéndose igual
-            json.dump({"version": 2, "relative": rel,
-                       "events": self.events}, f)
+            json.dump(datos, f)
         self.current_file = path
         self.lbl_macro.configure(
             text=f"Macro: {os.path.basename(path)} ({len(self.events)} eventos"
@@ -3627,6 +3847,14 @@ class App:
         except Exception as exc:
             messagebox.showerror("Error", f"No se pudo cargar: {exc}")
             return
+        self.ancla_img, self.ancla_pos = None, None
+        if data.get("ancla"):
+            try:
+                self.ancla_img = texto_a_ancla(data["ancla"])
+                self.ancla_pos = tuple(data.get("ancla_pos", (0, 0)))
+            except Exception as exc:
+                self.log(f"La macro traía una foto de la vista pero no se "
+                         f"puede leer ({exc}); no habrá alineación.")
         self.current_file = path
         dur = self.events[-1]["t"] if self.events else 0
         rel = Player.es_relativa(self.events)
@@ -3637,6 +3865,11 @@ class App:
         self.log(f"Cargada {os.path.basename(path)}"
                  + (" — lleva movimiento relativo, así que se reproducirá para "
                     "un juego en 1ª persona." if rel else ""))
+        if rel:
+            self.log("   " + ("Trae foto de la vista: alinearé la cámara antes "
+                              "de reproducir." if self.ancla_img is not None
+                              else "Sin foto de la vista: tendrás que colocar "
+                                   "la cámara tú antes de reproducir."))
         # la casilla sigue al contenido, para que no engañe
         self.var_relative.set(rel)
         self.recorder.relative = rel
@@ -3662,11 +3895,11 @@ class App:
                 beep(False)
                 return
             self.watcher.start()
-            self.btn_watch.configure(text="Desactivar vigilancia (F9)")
+            self.btn_watch.configure(text=f"Desactivar vigilancia ({T_WATCH})")
             self.log(f"Vigilancia ACTIVADA (modo {self.finder.mode}).")
         else:
             self.watcher.stop()
-            self.btn_watch.configure(text="Activar vigilancia (F9)")
+            self.btn_watch.configure(text=f"Activar vigilancia ({T_WATCH})")
             self.set_status("Inactivo")
             self.log("Vigilancia desactivada.")
 
